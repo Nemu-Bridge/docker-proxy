@@ -1,0 +1,241 @@
+# Docker Proxy Configuration
+# ===========================
+
+global:
+  port: 2376
+  # socket: /var/run/docker.sock  # Override socket path
+  # log_level: debug               # Override log level
+
+# Authentication
+# --------------
+auth:
+  type: bearer
+  tokens:
+    - token: "admin-token-abc123"
+      role: admin
+    - token: "readonly-token-xyz789"
+      role: readonly
+
+# Access Rules (evaluated in order, first match wins)
+# ---------------------------------------------------
+rules:
+  # --- Block Dangerous Operations ---
+
+  - name: "block-exec-operations"
+    description: Prevent creating or starting exec sessions (OR logic)
+    conditions:
+      - or:
+          - field: path
+            operator: matches
+            value: "^/containers/[^/]+/exec$"
+          - field: path
+            operator: matches
+            value: "^/exec/[^/]+/start$"
+    action: deny
+    message: "Exec operations are not permitted"
+    status: 403
+
+  - name: "block-docker-build"
+    description: Prevent image builds via the API
+    conditions:
+      - field: path
+        operator: starts_with
+        value: "/build"
+    action: deny
+    message: "Image building is not permitted via this proxy"
+
+  # --- Readonly Resource Endpoints ---
+
+  - name: "readonly-volumes"
+    description: Only GET is allowed on volumes
+    conditions:
+      - field: path
+        operator: starts_with
+        value: "/volumes"
+      - field: method
+        operator: not_equals
+        value: GET
+    action: deny
+    message: "Volume mutations are forbidden"
+
+  - name: "readonly-networks"
+    description: Only GET is allowed on networks
+    conditions:
+      - field: path
+        operator: starts_with
+        value: "/networks"
+      - field: method
+        operator: not_equals
+        value: GET
+    action: deny
+    message: "Network mutations are forbidden"
+
+  - name: "readonly-images"
+    description: Only GET is allowed on images
+    conditions:
+      - field: path
+        operator: starts_with
+        value: "/images"
+      - field: method
+        operator: in
+        value: ["PUT", "POST", "DELETE"]
+    action: deny
+    message: "Image mutations are forbidden"
+
+  - name: "block-secrets"
+    description: Completely block access to secrets
+    conditions:
+      - field: path
+        operator: starts_with
+        value: "/secrets"
+    action: deny
+    message: "Secrets are not accessible"
+
+  - name: "block-configs"
+    description: Completely block access to configs
+    conditions:
+      - field: path
+        operator: starts_with
+        value: "/configs"
+    action: deny
+    message: "Configs are not accessible"
+
+  # --- Body Inspection (Prevent Privilege Escalation) ---
+
+  - name: "block-privileged-containers"
+    description: Prevent creating containers with --privileged flag
+    conditions:
+      - field: path
+        operator: equals
+        value: "/containers/create"
+      - field: body.HostConfig.Privileged
+        operator: equals
+        value: true
+    action: deny
+    message: "Privileged containers are not allowed"
+
+  - name: "block-host-network-mode"
+    description: Prevent containers from using host networking
+    conditions:
+      - field: path
+        operator: equals
+        value: "/containers/create"
+      - field: body.HostConfig.NetworkMode
+        operator: equals
+        value: "host"
+    action: deny
+    message: "Host network mode is not allowed"
+
+  - name: "block-bind-mounts"
+    description: Prevent containers from bind mounting host paths
+    conditions:
+      - field: path
+        operator: equals
+        value: "/containers/create"
+      - field: body.HostConfig.Binds
+        operator: exists
+    action: deny
+    message: "Bind mounts are not allowed"
+
+  - name: "block-host-pid-namespace"
+    description: Prevent containers from using the host PID namespace
+    conditions:
+      - field: path
+        operator: equals
+        value: "/containers/create"
+      - field: body.HostConfig.PidMode
+        operator: equals
+        value: "host"
+    action: deny
+    message: "Host PID namespace is not allowed"
+
+  # --- Role-Based Access ---
+
+  - name: "admin-only-container-lifecycle"
+    description: Only admins can start/stop/restart/kill containers
+    conditions:
+      - field: path
+        operator: matches
+        value: "^/containers/[^/]+/(start|stop|restart|kill|pause|unpause|rename|update)$"
+    action: require_role
+    role: admin
+    message: "Admin role required for container lifecycle operations"
+
+  - name: "admin-only-delete"
+    description: Only admins can delete resources
+    conditions:
+      - field: method
+        operator: equals
+        value: DELETE
+    action: require_role
+    role: admin
+    message: "Admin role required for delete operations"
+
+  - name: "admin-only-create"
+    description: Only admins can create containers/images
+    conditions:
+      - field: path
+        operator: equals
+        value: "/containers/create"
+    action: require_role
+    role: admin
+    message: "Admin role required to create containers"
+
+  # --- IP Restriction ---
+
+  - name: "internal-network-only"
+    description: Restrict access to private network ranges and localhost
+    conditions:
+      - field: client_ip
+        operator: not_in
+        value:
+          - "10.0.0.0/8"
+          - "172.16.0.0/12"
+          - "192.168.0.0/16"
+          - "127.0.0.0/8"
+    action: deny
+    message: "Access restricted to internal network"
+
+  # --- Response Filtering (Redact Sensitive Data) ---
+
+  - name: "redact-container-environment"
+    description: Redact environment variables and commands from container inspect
+    conditions:
+      - field: path
+        operator: matches
+        value: "^/containers/[^/]+/json$"
+    action: response_filter
+    response_filter:
+      - field: Config.Env
+        action: redact
+      - field: Config.Cmd
+        action: redact
+
+  - name: "redact-container-command-in-list"
+    description: Hide commands in container listing
+    conditions:
+      - field: path
+        operator: equals
+        value: "/containers/json"
+    action: response_filter
+    response_filter:
+      - field: Command
+        action: redact
+      - field: Labels
+        action: redact
+
+  # --- Rate Limiting ---
+
+  - name: "rate-limit-all"
+    description: Limit all requests to 50 per 30 seconds, 30s penalty on exceed
+    conditions:
+      - field: path
+        operator: matches
+        value: "^/"
+    action: rate_limit
+    rate_limit:
+      requests: 50
+      period: 30
+      penalty: 30
+    message: "Rate limit exceeded. You are blocked for 30 seconds."
+    status: 429
