@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 const LATENCY_BUCKETS_MS: &[u64] = &[5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
+const LATENCY_BUCKET_COUNT: usize = 12;
 
 pub struct Metrics {
     pub requests_total: AtomicU64,
@@ -18,7 +19,7 @@ pub struct Metrics {
     pub bad_request_total: AtomicU64,
     pub upgrade_total: AtomicU64,
     by_rule: Mutex<HashMap<String, RuleCounters>>,
-    latency: Mutex<LatencyHistogram>,
+    latency: LatencyHistogram,
 }
 
 #[derive(Default)]
@@ -28,35 +29,44 @@ struct RuleCounters {
 }
 
 struct LatencyHistogram {
-    buckets: Vec<u64>,
-    sum_ms: f64,
-    count: u64,
+    buckets: [AtomicU64; LATENCY_BUCKET_COUNT],
+    sum_ms: AtomicU64,
+    count: AtomicU64,
 }
 
 impl LatencyHistogram {
-    fn new() -> Self {
+    const fn new() -> Self {
         LatencyHistogram {
-            buckets: vec![0; LATENCY_BUCKETS_MS.len() + 1],
-            sum_ms: 0.0,
-            count: 0,
+            buckets: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
+            sum_ms: AtomicU64::new(0),
+            count: AtomicU64::new(0),
         }
     }
 
-    fn observe(&mut self, ms: u64) {
-        self.sum_ms += ms as f64;
-        self.count += 1;
-        let mut placed = false;
+    fn observe(&self, ms: u64) {
+        self.sum_ms.fetch_add(ms, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        let mut placed_idx = LATENCY_BUCKET_COUNT - 1;
         for (i, bound) in LATENCY_BUCKETS_MS.iter().enumerate() {
             if ms <= *bound {
-                self.buckets[i] += 1;
-                placed = true;
+                placed_idx = i;
                 break;
             }
         }
-        if !placed {
-            let last = self.buckets.len() - 1;
-            self.buckets[last] += 1;
-        }
+        self.buckets[placed_idx].fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -76,7 +86,7 @@ impl Metrics {
             bad_request_total: AtomicU64::new(0),
             upgrade_total: AtomicU64::new(0),
             by_rule: Mutex::new(HashMap::new()),
-            latency: Mutex::new(LatencyHistogram::new()),
+            latency: LatencyHistogram::new(),
         }
     }
 
@@ -91,8 +101,7 @@ impl Metrics {
     }
 
     pub fn observe_upstream_latency_ms(&self, ms: u64) {
-        let mut g = self.latency.lock().unwrap_or_else(|p| p.into_inner());
-        g.observe(ms);
+        self.latency.observe(ms);
     }
 
     pub fn render_prometheus(&self) -> String {
@@ -144,24 +153,33 @@ impl Metrics {
         }
         drop(by_rule);
 
-        let lat = self.latency.lock().unwrap_or_else(|p| p.into_inner());
         out.push_str("# HELP docker_proxy_upstream_latency_ms Latency to docker upstream in milliseconds\n");
         out.push_str("# TYPE docker_proxy_upstream_latency_ms histogram\n");
+        let bucket_snapshots: [u64; LATENCY_BUCKET_COUNT] = std::array::from_fn(|i| {
+            self.latency.buckets[i].load(Ordering::Relaxed)
+        });
         let mut cumulative = 0u64;
         for (i, bound) in LATENCY_BUCKETS_MS.iter().enumerate() {
-            cumulative = cumulative.saturating_add(lat.buckets[i]);
+            cumulative = cumulative.saturating_add(bucket_snapshots[i]);
             out.push_str(&format!(
                 "docker_proxy_upstream_latency_ms_bucket{{le=\"{}\"}} {}\n",
                 bound, cumulative
             ));
         }
-        cumulative = cumulative.saturating_add(*lat.buckets.last().unwrap_or(&0));
+        cumulative = cumulative
+            .saturating_add(bucket_snapshots[LATENCY_BUCKET_COUNT - 1]);
         out.push_str(&format!(
             "docker_proxy_upstream_latency_ms_bucket{{le=\"+Inf\"}} {}\n",
             cumulative
         ));
-        out.push_str(&format!("docker_proxy_upstream_latency_ms_sum {}\n", lat.sum_ms));
-        out.push_str(&format!("docker_proxy_upstream_latency_ms_count {}\n", lat.count));
+        out.push_str(&format!(
+            "docker_proxy_upstream_latency_ms_sum {}\n",
+            self.latency.sum_ms.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "docker_proxy_upstream_latency_ms_count {}\n",
+            self.latency.count.load(Ordering::Relaxed)
+        ));
 
         out
     }

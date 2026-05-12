@@ -46,6 +46,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
 const UPGRADE_IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
+const UPGRADE_RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
+const UPGRADE_COPY_BUF_BYTES: usize = 32 * 1024;
 const AUTH_FAIL_MAX: u32 = 10;
 const AUTH_FAIL_WINDOW: Duration = Duration::from_secs(60);
 const AUTH_FAIL_LOCKOUT: Duration = Duration::from_secs(300);
@@ -537,8 +539,9 @@ async fn handle(
     let mut header_map: HashMap<String, String> = HashMap::new();
     for (key, value) in req.headers().iter() {
         if let Ok(v) = value.to_str() {
-            let name = key.as_str().to_ascii_lowercase();
-            header_map.entry(name).or_insert_with(|| v.to_string());
+            header_map
+                .entry(key.as_str().to_string())
+                .or_insert_with(|| v.to_string());
         }
     }
 
@@ -552,17 +555,17 @@ async fn handle(
         .headers()
         .iter()
         .filter_map(|(k, v)| {
-            let name = k.as_str().to_ascii_lowercase();
-            if HOP_BY_HOP_HEADERS.iter().any(|h| *h == name) {
+            let name = k.as_str();
+            if HOP_BY_HOP_HEADERS.contains(&name) {
                 return None;
             }
-            if CLIENT_FORWARD_DROP_HEADERS.iter().any(|h| *h == name) {
+            if CLIENT_FORWARD_DROP_HEADERS.contains(&name) {
                 return None;
             }
             if name == "upgrade" {
                 return None;
             }
-            Some((name, v.clone()))
+            Some((name.to_string(), v.clone()))
         })
         .collect();
 
@@ -875,8 +878,8 @@ async fn handle(
     let mut response_builder = Response::builder().status(status);
     let mut emitted_content_type = false;
     for (k, v) in upstream_headers.iter() {
-        let name = k.as_str().to_ascii_lowercase();
-        if HOP_BY_HOP_HEADERS.iter().any(|h| *h == name) {
+        let name = k.as_str();
+        if HOP_BY_HOP_HEADERS.contains(&name) {
             continue;
         }
         if name == "content-length" {
@@ -1001,8 +1004,8 @@ async fn handle_upgrade(
         log_request(peer, &method, &canonical_path, &user_agent, upstream_status);
         let mut rb = Response::builder().status(upstream_status);
         for (k, v) in upstream_headers.iter() {
-            let name = k.as_str().to_ascii_lowercase();
-            if HOP_BY_HOP_HEADERS.iter().any(|h| *h == name) {
+            let name = k.as_str();
+            if HOP_BY_HOP_HEADERS.contains(&name) {
                 continue;
             }
             if name == "content-length" {
@@ -1020,19 +1023,33 @@ async fn handle_upgrade(
 
     let metrics_for_task = state.metrics.clone();
     tokio::spawn(async move {
-        let client_upgraded = match client_upgrade_fut.await {
-            Ok(u) => u,
-            Err(e) => {
+        let client_upgraded = match timeout(UPGRADE_RESOLVE_TIMEOUT, client_upgrade_fut).await {
+            Ok(Ok(u)) => u,
+            Ok(Err(e)) => {
                 metrics_for_task.upstream_errors_total.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("client upgrade failed: {e}");
+                conn_join.abort();
+                return;
+            }
+            Err(_) => {
+                metrics_for_task.upstream_timeouts_total.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!("client upgrade resolve timeout");
+                conn_join.abort();
                 return;
             }
         };
-        let docker_upgraded = match docker_upgrade_fut.await {
-            Ok(u) => u,
-            Err(e) => {
+        let docker_upgraded = match timeout(UPGRADE_RESOLVE_TIMEOUT, docker_upgrade_fut).await {
+            Ok(Ok(u)) => u,
+            Ok(Err(e)) => {
                 metrics_for_task.upstream_errors_total.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("docker upgrade failed: {e}");
+                conn_join.abort();
+                return;
+            }
+            Err(_) => {
+                metrics_for_task.upstream_timeouts_total.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!("docker upgrade resolve timeout");
+                conn_join.abort();
                 return;
             }
         };
@@ -1044,7 +1061,7 @@ async fn handle_upgrade(
         let (mut dr, mut dw) = tokio::io::split(&mut docker_io);
 
         let c2d = async {
-            let mut buf = [0u8; 8192];
+            let mut buf = vec![0u8; UPGRADE_COPY_BUF_BYTES];
             loop {
                 let n = match timeout(UPGRADE_IDLE_TIMEOUT, cr.read(&mut buf)).await {
                     Ok(Ok(0)) => break,
@@ -1059,7 +1076,7 @@ async fn handle_upgrade(
         };
 
         let d2c = async {
-            let mut buf = [0u8; 8192];
+            let mut buf = vec![0u8; UPGRADE_COPY_BUF_BYTES];
             loop {
                 let n = match timeout(UPGRADE_IDLE_TIMEOUT, dr.read(&mut buf)).await {
                     Ok(Ok(0)) => break,
@@ -1079,11 +1096,11 @@ async fn handle_upgrade(
 
     let mut response_builder = Response::builder().status(upstream_status);
     for (k, v) in upstream_headers.iter() {
-        let name = k.as_str().to_ascii_lowercase();
+        let name = k.as_str();
         if name == "content-length" {
             continue;
         }
-        if HOP_BY_HOP_HEADERS.iter().any(|h| *h == name) && name != "connection" && name != "upgrade" {
+        if HOP_BY_HOP_HEADERS.contains(&name) && name != "connection" && name != "upgrade" {
             continue;
         }
         response_builder = response_builder.header(k, v);
