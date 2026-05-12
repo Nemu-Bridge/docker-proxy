@@ -1,0 +1,77 @@
+# TLS-terminated proxy with bearer-token auth
+#
+# Use when exposing the proxy off-host. The TCP listener is wrapped in
+# rustls; clients must speak HTTPS. Tokens still flow at the application
+# layer.
+#
+# Generate a self-signed cert for local testing with:
+#   openssl req -x509 -newkey rsa:4096 -nodes -days 365 \
+#     -keyout /etc/docker-proxy/server.key \
+#     -out /etc/docker-proxy/server.crt \
+#     -subj "/CN=docker-proxy"
+
+global:
+  port: 2376
+  bind: "0.0.0.0"
+  log_format: json
+  audit_log: /var/log/docker-proxy-audit.log
+  tls:
+    cert: /etc/docker-proxy/server.crt
+    key: /etc/docker-proxy/server.key
+  metrics:
+    enabled: true
+    path: /metrics
+
+auth:
+  type: bearer
+  tokens:
+    - token: "${ADMIN_TOKEN}"
+      role: admin
+    - token: "${READONLY_TOKEN}"
+      role: readonly
+
+rules:
+  - name: "rate-limit-prelude"
+    priority: 1000
+    conditions:
+      - field: path
+        operator: matches
+        value: "^/"
+    action: rate_limit
+    rate_limit:
+      requests: 200
+      period: 60
+      penalty: 60
+    status: 429
+    message: "Rate limit exceeded"
+
+  - name: "block-secrets"
+    priority: 500
+    conditions:
+      - field: path
+        operator: starts_with
+        value: /secrets
+    action: deny
+    message: "Secrets are not accessible"
+
+  - name: "block-exec"
+    priority: 500
+    conditions:
+      - or:
+          - field: path
+            operator: matches
+            value: "^/containers/[^/]+/exec$"
+          - field: path
+            operator: matches
+            value: "^/exec/[^/]+/start$"
+    action: deny
+    message: "Exec operations are not permitted"
+
+  - name: "admin-only-mutations"
+    conditions:
+      - field: method
+        operator: in
+        value: [POST, PUT, DELETE, PATCH]
+    action: require_role
+    role: admin
+    message: "Admin role required for mutating operations"

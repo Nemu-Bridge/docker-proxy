@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="Nemu-Bridge/docker-proxy"
+BIN_NAME="docker-proxy"
+INSTALL_DIR="/usr/local/bin"
+CONFIG_DIR="/etc/docker-proxy"
+CONFIG_FILE="${CONFIG_DIR}/config.yaml"
+SERVICE_FILE="docker-proxy.service"
+SYSTEMD_DIR="/etc/systemd/system"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+log()  { echo -e "${GREEN}[+]${NC} $*"; }
+warn() { echo -e "${YELLOW}[!]${NC} $*"; }
+err()  { echo -e "${RED}[-]${NC} $*" >&2; }
+
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        err "This script must be run as root (sudo ./setup)"
+        exit 1
+    fi
+}
+
+detect_os() {
+    case "$(uname -s)" in
+        Linux)  echo "linux" ;;
+        Darwin) echo "macos" ;;
+        *)      err "Unsupported OS: $(uname -s)"; exit 1 ;;
+    esac
+}
+
+detect_arch() {
+    local os="$1"
+    local arch
+    arch=$(uname -m)
+    case "$os" in
+        linux)
+            case "$arch" in
+                x86_64|amd64)  echo "x86_64" ;;
+                aarch64|arm64) echo "aarch64" ;;
+                *) err "Unsupported architecture: $arch"; exit 1 ;;
+            esac
+            ;;
+        macos)
+            case "$arch" in
+                x86_64)  echo "x86_64" ;;
+                arm64)   echo "arm64" ;;
+                *) err "Unsupported architecture: $arch"; exit 1 ;;
+            esac
+            ;;
+    esac
+}
+
+generate_token() {
+    local length="${1:-64}"
+    if command -v openssl &>/dev/null; then
+        openssl rand -base64 96 | tr -dc 'A-Za-z0-9' | head -c "$length"
+    elif [ -r /dev/urandom ]; then
+        LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "$length"
+    else
+        local out=""
+        while [ "${#out}" -lt "$length" ]; do
+            out="${out}$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/random 2>/dev/null || printf '%x' "$RANDOM$RANDOM$RANDOM")"
+        done
+        echo "${out:0:$length}"
+    fi
+}
+
+get_latest_tag() {
+    # try gh CLI first
+    if command -v gh &>/dev/null && gh auth status &>/dev/null 2>&1; then
+        gh release list -R "$REPO" --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null && return
+    fi
+    # try curl with API (works for public repos)
+    local tag
+    tag=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+        | grep '"tag_name"' | head -1 | sed 's/.*: *"\(.*\)".*/\1/')
+    if [ -n "$tag" ]; then
+        echo "$tag"
+        return
+    fi
+    echo ""
+}
+
+download_via_gh() {
+    local os="$1" arch="$2" tmp="$3" asset="$4"
+    if command -v gh &>/dev/null && gh auth status &>/dev/null 2>&1; then
+        log "Downloading via gh CLI ..."
+        gh release download -R "$REPO" -p "$asset" -D "$tmp" 2>/dev/null && return 0
+        warn "gh download failed"
+    fi
+    return 1
+}
+
+download_via_curl() {
+    local tag="$1" asset="$2" tmp="$3"
+    local url="https://github.com/${REPO}/releases/download/${tag}/${asset}"
+    log "Downloading from ${url} ..."
+    if command -v curl &>/dev/null; then
+        curl -fSL --progress-bar "$url" -o "$tmp/$BIN_NAME" 2>/dev/null && return 0
+    elif command -v wget &>/dev/null; then
+        wget -q --show-progress "$url" -O "$tmp/$BIN_NAME" 2>/dev/null && return 0
+    fi
+    return 1
+}
+
+try_clone_and_setup() {
+    log "Attempting to clone repository ..."
+    local clone_dir
+    clone_dir=$(mktemp -d)
+
+    local cloned=0
+    if ssh -T git@github.com 2>&1 | grep -q "successfully authenticated"; then
+        git clone "git@github.com:${REPO}.git" "$clone_dir" 2>/dev/null && cloned=1
+    fi
+    if [ "$cloned" -eq 0 ]; then
+        git clone "https://github.com/${REPO}.git" "$clone_dir" 2>/dev/null && cloned=1
+    fi
+
+    if [ "$cloned" -eq 1 ]; then
+        log "Repository cloned. Running local setup ..."
+        cd "$clone_dir"
+        if [ -f ./setup ]; then
+            chmod +x ./setup
+            exec ./setup
+        else
+            err "setup script not found in cloned repo"
+        fi
+    fi
+    rm -rf "$clone_dir"
+    return 1
+}
+
+download_binary() {
+    local os="$1"
+    local arch="$2"
+    local asset_name="${BIN_NAME}-${os}-${arch}"
+
+    log "Platform: ${os} / ${arch}"
+
+    local tag
+    tag=$(get_latest_tag)
+
+    local tmp
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+
+    if [ -n "$tag" ]; then
+        log "Latest release: ${tag}"
+        if download_via_gh "$os" "$arch" "$tmp" "$asset_name"; then
+            install_binary "$tmp" && return 0
+        fi
+        if download_via_curl "$tag" "$asset_name" "$tmp"; then
+            install_binary "$tmp" && return 0
+        fi
+    else
+        warn "Could not determine latest release tag"
+        if download_via_gh "$os" "$arch" "$tmp" "$asset_name"; then
+            install_binary "$tmp" && return 0
+        fi
+    fi
+
+    # download failed, try clone
+    warn "Direct download failed"
+    if try_clone_and_setup; then
+        exit 0
+    fi
+
+    echo ""
+    echo -e "  ${RED}Failed to download docker-proxy.${NC}"
+    echo ""
+    echo -e "  ${BOLD}Download it manually:${NC}"
+    echo ""
+    echo -e "  ${CYAN}https://github.com/${REPO}/releases${NC}"
+    echo ""
+    echo -e "  ${BOLD}Look for: ${asset_name}${NC}"
+    echo ""
+    echo -e "  After downloading, copy it to ${INSTALL_DIR}/${BIN_NAME}:"
+    echo -e "  ${BOLD}sudo cp ${asset_name} ${INSTALL_DIR}/${BIN_NAME}${NC}"
+    echo -e "  ${BOLD}sudo chmod +x ${INSTALL_DIR}/${BIN_NAME}${NC}"
+    echo ""
+    echo -e "  Then re-run this script."
+    echo ""
+    exit 1
+}
+
+install_binary() {
+    local tmp="$1"
+    chmod +x "$tmp/$BIN_NAME"
+    mv "$tmp/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
+    log "Installed ${BIN_NAME} to ${INSTALL_DIR}/${BIN_NAME}"
+    return 0
+}
+
+write_config() {
+    local admin_token="$1"
+    local readonly_token="$2"
+
+    mkdir -p "$CONFIG_DIR"
+
+    if [ -f "$CONFIG_FILE" ]; then
+        warn "Config already exists at ${CONFIG_FILE} -- backing up to ${CONFIG_FILE}.bak"
+        cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
+    fi
+
+    log "Writing config to ${CONFIG_FILE}"
+
+    cat > "$CONFIG_FILE" << YAML
+global:
+  port: 2376
+  socket: /var/run/docker.sock
+
+auth:
+  type: bearer
+  tokens:
+    - token: "${admin_token}"
+      role: admin
+    - token: "${readonly_token}"
+      role: readonly
+
+rules:
+  - name: "rate-limit-all"
+    description: Limit all requests to 50 per 30 seconds, 30s penalty on exceed
+    conditions:
+      - field: path
+        operator: matches
+        value: "^/"
+    action: rate_limit
+    rate_limit:
+      requests: 50
+      period: 30
+      penalty: 30
+    message: "Rate limit exceeded"
+    status: 429
+YAML
+
+    chmod 640 "$CONFIG_FILE"
+}
+
+install_service_linux() {
+    if [ ! -f "$SERVICE_FILE" ]; then
+        warn "${SERVICE_FILE} not found in current directory -- skipping service install"
+        warn "Run this script from the repository root for automatic service setup."
+        return
+    fi
+
+    cp "$SERVICE_FILE" "$SYSTEMD_DIR/$SERVICE_FILE"
+    log "Installed ${SYSTEMD_DIR}/${SERVICE_FILE}"
+
+    systemctl daemon-reload
+    log "systemd daemon reloaded"
+
+    systemctl enable "$SERVICE_FILE"
+    log "Service enabled (starts on boot)"
+
+    systemctl start "$SERVICE_FILE"
+    log "Service started"
+
+    sleep 2
+    if systemctl is-active --quiet "$SERVICE_FILE"; then
+        log "docker-proxy is running"
+    else
+        warn "Service may not have started. Check: journalctl -u ${SERVICE_FILE}"
+    fi
+}
+
+main() {
+    echo ""
+    echo -e "  ${BOLD}Docker Proxy -- Setup${NC}"
+    echo ""
+
+    local os
+    os=$(detect_os)
+
+    require_root
+
+    local arch
+    arch=$(detect_arch "$os")
+
+    download_binary "$os" "$arch"
+
+    echo ""
+    log "Generating authentication tokens..."
+
+    local admin_token
+    admin_token=$(generate_token 64)
+
+    local readonly_token
+    readonly_token=$(generate_token 64)
+
+    write_config "$admin_token" "$readonly_token"
+
+    echo ""
+    echo -e "  ${BOLD}Tokens generated:${NC}"
+    echo ""
+    echo -e "  ${CYAN}Admin (full access):${NC}"
+    echo -e "    ${BOLD}${admin_token}${NC}"
+    echo ""
+    echo -e "  ${CYAN}Readonly (GET only):${NC}"
+    echo -e "    ${BOLD}${readonly_token}${NC}"
+    echo ""
+    echo -e "  ${YELLOW}Save these tokens now. They will not be shown again.${NC}"
+    echo ""
+
+    if [ "$os" = "linux" ] && [ -f "$SERVICE_FILE" ]; then
+        echo ""
+        read -r -p "  Install systemd service? [Y/n] " answer
+        if [ -z "$answer" ] || [[ "$answer" =~ ^[Yy]$ ]]; then
+            install_service_linux
+        else
+            log "Service install skipped."
+        fi
+    fi
+
+    if [ "$os" = "macos" ]; then
+        echo ""
+        echo -e "  ${YELLOW}macOS detected -- no service installed. Start manually:${NC}"
+        echo ""
+        echo -e "    ${BOLD}DOCKER_PROXY_CONFIG=${CONFIG_FILE} ${BIN_NAME}${NC}"
+        echo ""
+        echo -e "  ${YELLOW}To run in the background:${NC}"
+        echo -e "    ${BOLD}nohup DOCKER_PROXY_CONFIG=${CONFIG_FILE} ${BIN_NAME} &${NC}"
+        echo ""
+    fi
+
+    echo ""
+    log "Setup complete."
+    echo ""
+    echo "  Binary:   ${INSTALL_DIR}/${BIN_NAME}"
+    echo "  Config:   ${CONFIG_FILE}"
+    echo ""
+    echo "  Test (admin):"
+    echo "    curl -H 'Authorization: Bearer ${admin_token}' http://127.0.0.1:2376/version"
+    echo ""
+    echo "  Test (readonly):"
+    echo "    curl -H 'Authorization: Bearer ${readonly_token}' http://127.0.0.1:2376/version"
+    echo ""
+}
+
+main

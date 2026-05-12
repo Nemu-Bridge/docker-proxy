@@ -1,0 +1,103 @@
+# Mutual TLS proxy
+#
+# Clients must present a certificate signed by client_ca. The cert's
+# CN (or matching entry in cert_role_map) is used as the role. No
+# bearer tokens involved.
+#
+# Generate a client CA and a client cert for testing:
+#   openssl req -x509 -newkey rsa:4096 -nodes -days 365 \
+#     -keyout ca.key -out ca.crt -subj "/CN=docker-proxy-ca"
+#   openssl req -newkey rsa:4096 -nodes \
+#     -keyout admin.key -out admin.csr -subj "/CN=admin.ops.example.com"
+#   openssl x509 -req -in admin.csr -CA ca.crt -CAkey ca.key \
+#     -CAcreateserial -out admin.crt -days 365
+
+global:
+  port: 2376
+  bind: "0.0.0.0"
+  log_format: json
+  audit_log: /var/log/docker-proxy-audit.log
+  tls:
+    cert: /etc/docker-proxy/server.crt
+    key: /etc/docker-proxy/server.key
+    client_ca: /etc/docker-proxy/ca.crt
+    require_client_cert: true
+  metrics:
+    enabled: true
+    path: /metrics
+
+auth:
+  type: mtls
+  mtls:
+    cert_role_map:
+      - cn: "admin.ops.example.com"
+        role: admin
+      - cn: "*.readonly.ops.example.com"
+        role: readonly
+    default_role: user
+
+rules:
+  - name: "rate-limit-prelude"
+    priority: 1000
+    conditions:
+      - field: path
+        operator: matches
+        value: "^/"
+    action: rate_limit
+    rate_limit:
+      requests: 300
+      period: 60
+      penalty: 60
+    status: 429
+
+  - name: "block-secrets"
+    priority: 500
+    conditions:
+      - field: path
+        operator: starts_with
+        value: /secrets
+    action: deny
+    message: "Secrets are not accessible"
+
+  - name: "block-capability-escalation"
+    priority: 500
+    description: Prevent containers from requesting dangerous Linux capabilities
+    conditions:
+      - field: path
+        operator: equals
+        value: /containers/create
+      - or:
+          - field: body.HostConfig.CapAdd
+            operator: contains
+            value: SYS_ADMIN
+          - field: body.HostConfig.CapAdd
+            operator: contains
+            value: NET_ADMIN
+          - field: body.HostConfig.CapAdd
+            operator: contains
+            value: SYS_PTRACE
+          - field: body.HostConfig.CapAdd
+            operator: contains
+            value: ALL
+    action: deny
+    message: "Adding privileged Linux capabilities is not allowed"
+
+  - name: "admin-mutations"
+    conditions:
+      - field: method
+        operator: in
+        value: [POST, PUT, DELETE, PATCH]
+    action: require_role
+    role: admin
+    message: "Admin role required for mutations"
+
+  - name: "watch-new-image-pulls"
+    description: Log image pulls without blocking, to verify the rule before enforcing
+    priority: 100
+    conditions:
+      - field: path
+        operator: starts_with
+        value: /images/create
+    action: deny
+    dry_run: true
+    message: "(dry-run) image pull would be denied"

@@ -1,0 +1,26 @@
+# Read-only proxy: all write operations denied, GET only
+#
+# Suitable for dashboard UIs or monitoring tools that only need read access.
+
+global:
+  port: 2376
+
+auth:
+  type: none
+
+rules:
+  - name: "allow-get"
+    conditions:
+      - field: method
+        operator: equals
+        value: GET
+    action: allow
+
+  - name: "deny-writes"
+    conditions:
+      - field: method
+        operator: not_equals
+        value: GET
+    action: deny
+    message: "This proxy is read-only"
+    status: 403

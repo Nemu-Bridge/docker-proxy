@@ -1,0 +1,31 @@
+[Unit]
+Description=Docker API Proxy
+Documentation=https://github.com/Nemu-Bridge/docker-proxy
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/docker-proxy
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=docker-proxy
+
+Environment="DOCKER_PROXY_CONFIG=/etc/docker-proxy/config.yaml"
+Environment="DOCKER_SOCKET=/var/run/docker.sock"
+Environment="DOCKER_PROXY_PORT=2376"
+Environment="RUST_LOG=info"
+
+User=root
+Group=docker
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/docker-proxy
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

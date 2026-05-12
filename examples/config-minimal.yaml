@@ -1,0 +1,23 @@
+# Minimal config: just rate limiting, no auth
+#
+# Use this when you want a transparent proxy with only rate limiting.
+
+global:
+  port: 2376
+
+auth:
+  type: none
+
+rules:
+  - name: "rate-limit-all"
+    conditions:
+      - field: path
+        operator: matches
+        value: "^/"
+    action: rate_limit
+    rate_limit:
+      requests: 100
+      period: 10
+      penalty: 30
+    message: "Rate limit exceeded"
+    status: 429

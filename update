@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="Nemu-Bridge/docker-proxy"
+RELEASE_DIR="release"
+BIN_NAME="docker-proxy"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+log()  { echo -e "${GREEN}[+]${NC} $*"; }
+err()  { echo -e "${RED}[-]${NC} $*" >&2; }
+
+check_gh() {
+    if ! command -v gh &>/dev/null; then
+        err "gh CLI is not installed."
+        err "  Install: brew install gh   (macOS)"
+        err "          or: https://cli.github.com/"
+        exit 1
+    fi
+    if ! gh auth status &>/dev/null 2>&1; then
+        err "gh is not authenticated. Run: gh auth login"
+        exit 1
+    fi
+    log "gh CLI ready"
+}
+
+check_binaries() {
+    local required=(
+        "${BIN_NAME}-linux-x86_64"
+        "${BIN_NAME}-linux-aarch64"
+        "${BIN_NAME}-macos-x86_64"
+        "${BIN_NAME}-macos-arm64"
+    )
+    local missing=()
+    for asset in "${required[@]}"; do
+        if [ ! -f "${RELEASE_DIR}/${asset}" ]; then
+            missing+=("$asset")
+        fi
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        err "Missing binaries in ${RELEASE_DIR}/:"
+        for m in "${missing[@]}"; do
+            err "  - $m"
+        done
+        err ""
+        err "Run ./build first to compile all targets."
+        exit 1
+    fi
+    log "All binaries present"
+}
+
+get_current_version() {
+    local tag
+    tag=$(gh release list -R "$REPO" --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || echo "")
+    if [ -z "$tag" ]; then
+        echo "v0.0.0"
+    else
+        echo "$tag"
+    fi
+}
+
+bump_version() {
+    local current="$1"
+    # strip leading v, bump patch, add v back
+    local ver="${current#v}"
+    local major minor patch
+    IFS='.' read -r major minor patch <<< "$ver"
+    patch=$((patch + 1))
+    echo "v${major}.${minor}.${patch}"
+}
+
+main() {
+    echo ""
+    echo -e "  ${BOLD}Docker Proxy -- Publish Release${NC}"
+    echo ""
+
+    check_gh
+    check_binaries
+
+    local current
+    current=$(get_current_version)
+    local suggested
+    suggested=$(bump_version "$current")
+
+    echo ""
+    echo -e "  Current version: ${CYAN}${current}${NC}"
+    echo -e "  Suggested next:  ${CYAN}${suggested}${NC}"
+    echo ""
+
+    local version
+    read -r -p "  Enter version tag [${suggested}]: " version
+    version="${version:-$suggested}"
+
+    # validate semver-like tag
+    if ! echo "$version" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+        err "Invalid version format. Use vX.Y.Z (e.g. v1.0.1)"
+        exit 1
+    fi
+
+    # check if tag already exists
+    if gh release view "$version" -R "$REPO" &>/dev/null 2>&1; then
+        err "Release ${version} already exists."
+        err "  Delete it first: gh release delete ${version} -R ${REPO} --yes"
+        exit 1
+    fi
+
+    echo ""
+    log "Creating release ${version} ..."
+    gh release create "$version" \
+        -R "$REPO" \
+        --title "$version" \
+        --notes "$(cat <<NOTES
+$(date '+%Y-%m-%d')
+
+Linux builds are statically linked (musl). macOS builds:
+- arm64: Apple Silicon (M1/M2/M3/M4)
+- x86_64: Intel Mac
+
+Install:
+\`\`\`bash
+curl -fsSL https://raw.githubusercontent.com/${REPO}/main/setup | sudo bash
+\`\`\`
+NOTES
+)" \
+        "${RELEASE_DIR}/${BIN_NAME}-linux-x86_64" \
+        "${RELEASE_DIR}/${BIN_NAME}-linux-aarch64" \
+        "${RELEASE_DIR}/${BIN_NAME}-macos-x86_64" \
+        "${RELEASE_DIR}/${BIN_NAME}-macos-arm64"
+
+    log "Release ${version} published."
+    echo ""
+    echo -e "  ${CYAN}https://github.com/${REPO}/releases/tag/${version}${NC}"
+    echo ""
+}
+
+main
