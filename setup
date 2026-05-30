@@ -16,9 +16,9 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-log()  { echo -e "${GREEN}[+]${NC} $*"; }
-warn() { echo -e "${YELLOW}[!]${NC} $*"; }
-err()  { echo -e "${RED}[-]${NC} $*" >&2; }
+log()  { echo -e "${GREEN}$*${NC}"; }
+warn() { echo -e "${YELLOW}$*${NC}"; }
+err()  { echo -e "${RED}$*${NC}" >&2; }
 
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
@@ -147,7 +147,6 @@ download_binary() {
     local tag
     tag=$(get_latest_tag)
 
-    local tmp
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
 
@@ -205,7 +204,6 @@ write_config() {
     mkdir -p "$CONFIG_DIR"
 
     if [ -f "$CONFIG_FILE" ]; then
-        warn "Config already exists at ${CONFIG_FILE} -- backing up to ${CONFIG_FILE}.bak"
         cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
     fi
 
@@ -243,36 +241,75 @@ YAML
     chmod 640 "$CONFIG_FILE"
 }
 
+extract_token() {
+    grep -B1 "role: $1" "$2" 2>/dev/null | head -1 | sed 's/.*"\(.*\)".*/\1/'
+}
+
 install_service_linux() {
-    if [ ! -f "$SERVICE_FILE" ]; then
-        warn "${SERVICE_FILE} not found in current directory -- skipping service install"
-        warn "Run this script from the repository root for automatic service setup."
-        return
-    fi
+    local action="${1:-install}"
 
-    cp "$SERVICE_FILE" "$SYSTEMD_DIR/$SERVICE_FILE"
-    log "Installed ${SYSTEMD_DIR}/${SERVICE_FILE}"
+    if [ "$action" = "install" ]; then
+        cat > "$SYSTEMD_DIR/$SERVICE_FILE" << 'UNIT'
+[Unit]
+Description=Docker API Proxy
+Documentation=https://github.com/Nemu-Bridge/docker-proxy
+After=network-online.target docker.service
+Wants=network-online.target docker.service
 
-    systemctl daemon-reload
-    log "systemd daemon reloaded"
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/docker-proxy
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=docker-proxy
 
-    systemctl enable "$SERVICE_FILE"
-    log "Service enabled (starts on boot)"
+Environment="DOCKER_PROXY_CONFIG=/etc/docker-proxy/config.yaml"
+Environment="DOCKER_SOCKET=/var/run/docker.sock"
+Environment="DOCKER_PROXY_PORT=2376"
+Environment="RUST_LOG=info"
 
-    systemctl start "$SERVICE_FILE"
-    log "Service started"
+User=root
+Group=docker
 
-    sleep 2
-    if systemctl is-active --quiet "$SERVICE_FILE"; then
-        log "docker-proxy is running"
-    else
-        warn "Service may not have started. Check: journalctl -u ${SERVICE_FILE}"
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/docker-proxy
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+        log "Installed ${SYSTEMD_DIR}/${SERVICE_FILE}"
+
+        systemctl daemon-reload
+        log "systemd daemon reloaded"
+
+        systemctl enable "$SERVICE_FILE"
+        log "Service enabled (starts on boot)"
+
+        echo ""
+        read -r -p "  Start the service now? [Y/n] " start_svc
+        if [ -z "$start_svc" ] || [[ "$start_svc" =~ ^[Yy]$ ]]; then
+            systemctl start "$SERVICE_FILE"
+            sleep 2
+            if systemctl is-active --quiet "$SERVICE_FILE"; then
+                log "Service started successfully"
+            else
+                warn "Service may not have started. Check: journalctl -u ${SERVICE_FILE}"
+            fi
+        else
+            log "Start it later: systemctl start ${SERVICE_FILE}"
+        fi
     fi
 }
 
 main() {
     echo ""
-    echo -e "  ${BOLD}Docker Proxy -- Setup${NC}"
+    echo -e "  ${BOLD}Docker Proxy - Setup${NC}"
     echo ""
 
     local os
@@ -286,18 +323,41 @@ main() {
     download_binary "$os" "$arch"
 
     echo ""
-    log "Generating authentication tokens..."
 
     local admin_token
-    admin_token=$(generate_token 64)
-
     local readonly_token
-    readonly_token=$(generate_token 64)
 
-    write_config "$admin_token" "$readonly_token"
+    if [ -f "$CONFIG_FILE" ]; then
+        warn "Config already exists at ${CONFIG_FILE}"
+        echo ""
+        read -r -p "  Keep existing tokens? [Y/n] " keep_tokens
+        if [ -z "$keep_tokens" ] || [[ "$keep_tokens" =~ ^[Yy]$ ]]; then
+            admin_token=$(extract_token "admin" "$CONFIG_FILE")
+            readonly_token=$(extract_token "readonly" "$CONFIG_FILE")
+            if [ -z "$admin_token" ] || [ -z "$readonly_token" ]; then
+                warn "Could not extract tokens from existing config - regenerating"
+                log "Generating authentication tokens..."
+                admin_token=$(generate_token 64)
+                readonly_token=$(generate_token 64)
+                write_config "$admin_token" "$readonly_token"
+            else
+                log "Keeping existing tokens"
+            fi
+        else
+            log "Regenerating authentication tokens..."
+            admin_token=$(generate_token 64)
+            readonly_token=$(generate_token 64)
+            write_config "$admin_token" "$readonly_token"
+        fi
+    else
+        log "Generating authentication tokens..."
+        admin_token=$(generate_token 64)
+        readonly_token=$(generate_token 64)
+        write_config "$admin_token" "$readonly_token"
+    fi
 
     echo ""
-    echo -e "  ${BOLD}Tokens generated:${NC}"
+    echo -e "  ${BOLD}Your tokens:${NC}"
     echo ""
     echo -e "  ${CYAN}Admin (full access):${NC}"
     echo -e "    ${BOLD}${admin_token}${NC}"
@@ -308,7 +368,7 @@ main() {
     echo -e "  ${YELLOW}Save these tokens now. They will not be shown again.${NC}"
     echo ""
 
-    if [ "$os" = "linux" ] && [ -f "$SERVICE_FILE" ]; then
+    if [ "$os" = "linux" ]; then
         echo ""
         read -r -p "  Install systemd service? [Y/n] " answer
         if [ -z "$answer" ] || [[ "$answer" =~ ^[Yy]$ ]]; then
@@ -320,7 +380,7 @@ main() {
 
     if [ "$os" = "macos" ]; then
         echo ""
-        echo -e "  ${YELLOW}macOS detected -- no service installed. Start manually:${NC}"
+        echo -e "  ${YELLOW}macOS detected - no service installed. Start manually:${NC}"
         echo ""
         echo -e "    ${BOLD}DOCKER_PROXY_CONFIG=${CONFIG_FILE} ${BIN_NAME}${NC}"
         echo ""

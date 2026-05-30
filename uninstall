@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BIN_NAME="docker-proxy"
+INSTALL_DIR="/usr/local/bin"
+CONFIG_DIR="/etc/docker-proxy"
+CONFIG_FILE="${CONFIG_DIR}/config.yaml"
+SERVICE_FILE="docker-proxy.service"
+SYSTEMD_DIR="/etc/systemd/system"
+SERVICE_PATH="${SYSTEMD_DIR}/${SERVICE_FILE}"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+log()  { echo -e "${GREEN}$*${NC}"; }
+warn() { echo -e "${YELLOW}$*${NC}"; }
+err()  { echo -e "${RED}$*${NC}" >&2; }
+
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        err "This script must be run as root (sudo ./uninstall)"
+        exit 1
+    fi
+}
+
+stop_service() {
+    if [ -f "$SERVICE_PATH" ]; then
+        if systemctl is-active --quiet "$SERVICE_FILE" 2>/dev/null; then
+            systemctl stop "$SERVICE_FILE"
+            log "Service stopped"
+        fi
+        if systemctl is-enabled --quiet "$SERVICE_FILE" 2>/dev/null; then
+            systemctl disable "$SERVICE_FILE"
+            log "Service disabled"
+        fi
+        rm -f "$SERVICE_PATH"
+        systemctl daemon-reload
+        log "Service file removed: ${SERVICE_PATH}"
+    fi
+}
+
+main() {
+    echo ""
+    echo -e "  ${BOLD}Docker Proxy - Uninstall${NC}"
+    echo ""
+
+    require_root
+
+    echo "  This will remove:"
+    echo "    Binary:   ${INSTALL_DIR}/${BIN_NAME}"
+    echo "    Config:   ${CONFIG_DIR}/"
+    if [ -f "$SERVICE_PATH" ]; then
+        echo "    Service:  ${SERVICE_PATH}"
+    fi
+    echo ""
+
+    read -r -p "  Proceed with uninstall? [y/N] " confirm
+    if [ -z "$confirm" ] || [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        log "Uninstall cancelled."
+        exit 0
+    fi
+
+    echo ""
+
+    stop_service
+
+    if [ -f "${INSTALL_DIR}/${BIN_NAME}" ]; then
+        rm -f "${INSTALL_DIR}/${BIN_NAME}"
+        log "Binary removed: ${INSTALL_DIR}/${BIN_NAME}"
+    else
+        log "Binary not found at ${INSTALL_DIR}/${BIN_NAME}"
+    fi
+
+    if [ -d "$CONFIG_DIR" ]; then
+        echo ""
+        log "Config directory found at ${CONFIG_DIR}"
+        echo ""
+        read -r -p "  Remove config directory and all tokens? [y/N] " remove_config
+        if [ -z "$remove_config" ] || [[ ! "$remove_config" =~ ^[Yy]$ ]]; then
+            log "Config directory kept at ${CONFIG_DIR}"
+        else
+            rm -rf "$CONFIG_DIR"
+            log "Config directory removed: ${CONFIG_DIR}"
+        fi
+    fi
+
+    echo ""
+    log "Uninstall complete."
+    echo ""
+}
+
+main

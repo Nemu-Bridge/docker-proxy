@@ -11,8 +11,8 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-log()  { echo -e "${GREEN}[+]${NC} $*"; }
-err()  { echo -e "${RED}[-]${NC} $*" >&2; }
+log()  { echo -e "${GREEN}$*${NC}"; }
+err()  { echo -e "${RED}$*${NC}" >&2; }
 
 check_gh() {
     if ! command -v gh &>/dev/null; then
