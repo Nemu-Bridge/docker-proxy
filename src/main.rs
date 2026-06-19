@@ -8,7 +8,7 @@ use docker_proxy::rules::{
 };
 use docker_proxy::tls::{self, CertIdentity};
 use docker_proxy::upgrade::is_upgrade_request;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::{
     body::{Bytes, Incoming},
     server::conn::http1,
@@ -16,6 +16,8 @@ use hyper::{
     HeaderMap, Request, Response, StatusCode,
 };
 use hyper_util::rt::TokioIo;
+use ipnet::IpNet;
+use regex::Regex;
 use serde_json::Value as JsonValue;
 use std::{
     collections::HashMap,
@@ -27,10 +29,13 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UnixStream};
-use tokio::sync::Semaphore;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Notify, Semaphore};
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
+
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tracing::{error, info, warn};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -51,6 +56,23 @@ const UPGRADE_COPY_BUF_BYTES: usize = 32 * 1024;
 const AUTH_FAIL_MAX: u32 = 10;
 const AUTH_FAIL_WINDOW: Duration = Duration::from_secs(60);
 const AUTH_FAIL_LOCKOUT: Duration = Duration::from_secs(300);
+
+#[cfg(unix)]
+type UpstreamIo = TokioIo<UnixStream>;
+
+#[cfg(windows)]
+type UpstreamIo = TokioIo<TcpStream>;
+
+#[cfg(unix)]
+async fn connect_upstream(path: &std::path::Path) -> Result<UpstreamIo, BoxError> {
+    let stream = timeout(CONNECT_TIMEOUT, UnixStream::connect(path)).await??;
+    Ok(TokioIo::new(stream))
+}
+
+#[cfg(windows)]
+async fn connect_upstream(_path: &std::path::Path) -> Result<UpstreamIo, BoxError> {
+    Err("Windows is not a supported runtime platform for docker-proxy".into())
+}
 
 const HOP_BY_HOP_HEADERS: &[&str] = &[
     "connection",
@@ -95,6 +117,7 @@ impl ProxyState {
             .clone()
     }
 
+    #[cfg(unix)]
     fn swap_config(&self, new_cfg: Arc<ProxyConfig>) {
         let mut g = self
             .config_holder
@@ -193,7 +216,13 @@ fn sanitize_for_log(s: &str) -> String {
         .collect()
 }
 
-fn log_request(peer: SocketAddr, method: &hyper::Method, path: &str, user_agent: &str, status: StatusCode) {
+fn log_request(
+    peer: SocketAddr,
+    method: &hyper::Method,
+    path: &str,
+    user_agent: &str,
+    status: StatusCode,
+) {
     let now = Local::now().format("%m/%d/%Y %H:%M:%S");
     info!(
         "[{}] {} {} {} - {} - \"{}\"",
@@ -244,6 +273,82 @@ fn percent_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+fn strip_api_version_prefix(path: &str) -> &str {
+    if !path.starts_with("/v") || path.len() < 3 {
+        return path;
+    }
+    if let Some(second_slash) = path[2..].find('/') {
+        let version_part = &path[2..2 + second_slash];
+        if !version_part.is_empty()
+            && version_part != "."
+            && version_part.chars().all(|c| c.is_ascii_digit() || c == '.')
+        {
+            return &path[2 + second_slash..];
+        }
+    }
+    path
+}
+
+fn requires_json_body(path: &str) -> bool {
+    if path == "/containers/create" {
+        return true;
+    }
+    if Regex::new(r"^/containers/[^/]+/update$")
+        .map(|r| r.is_match(path))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    false
+}
+
+fn parse_trusted_proxies(raw: &[String]) -> Vec<IpNet> {
+    raw.iter().filter_map(|s| s.parse::<IpNet>().ok()).collect()
+}
+
+fn compute_client_ip(peer: &SocketAddr, headers: &HeaderMap, trusted_proxies: &[IpNet]) -> IpAddr {
+    let peer_ip = peer.ip();
+    if !trusted_proxies.iter().any(|net| net.contains(&peer_ip)) {
+        return peer_ip;
+    }
+
+    if let Some(v) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        if let Ok(ip) = v.trim().parse::<IpAddr>() {
+            return ip;
+        }
+    }
+
+    if let Some(v) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        for entry in v.split(',').map(|s| s.trim()).rev() {
+            if let Ok(ip) = entry.parse::<IpAddr>() {
+                if !trusted_proxies.iter().any(|net| net.contains(&ip)) {
+                    return ip;
+                }
+            }
+        }
+    }
+
+    if let Some(v) = headers.get("forwarded").and_then(|v| v.to_str().ok()) {
+        for segment in v.split(',').rev() {
+            for param in segment.split(';') {
+                let param = param.trim();
+                if let Some(rest) = param.strip_prefix("for=") {
+                    let raw = rest.trim_matches('"');
+                    let raw = raw
+                        .strip_prefix('[')
+                        .and_then(|s| s.strip_suffix(']'))
+                        .unwrap_or(raw);
+                    if let Ok(ip) = raw.parse::<IpAddr>() {
+                        return ip;
+                    }
+                }
+            }
+        }
+    }
+
+    peer_ip
+}
+
 fn canonicalize_path(raw: &str) -> Option<String> {
     if raw.is_empty() || !raw.starts_with('/') {
         return None;
@@ -259,6 +364,7 @@ fn canonicalize_path(raw: &str) -> Option<String> {
         return None;
     }
     let decoded = String::from_utf8(decoded_bytes).ok()?;
+    let decoded = strip_api_version_prefix(&decoded).to_string();
     let trailing_slash = decoded.len() > 1 && decoded.ends_with('/');
     let mut segments: Vec<&str> = Vec::new();
     for seg in decoded.split('/') {
@@ -300,16 +406,19 @@ fn resolve_token_role(config: &ProxyConfig, env_secret: &str, token: &str) -> Op
         let mut matched: Option<String> = None;
         if let Some(ref tokens) = auth_config.tokens {
             for t in tokens.iter() {
-                if constant_time_eq(t.token.as_bytes(), token_bytes) && matched.is_none() {
+                let eq = constant_time_eq(t.token.expose_secret().as_bytes(), token_bytes);
+                if eq && matched.is_none() {
                     matched = Some(t.role.clone().unwrap_or_else(|| "user".to_string()));
                 }
             }
         }
-        if matched.is_some() {
-            return matched;
+        if let Some(role) = matched {
+            return Some(role);
         }
         if let Some(ref secret) = auth_config.secret {
-            if !secret.is_empty() && constant_time_eq(secret.as_bytes(), token_bytes) {
+            if !secret.expose_secret().is_empty()
+                && constant_time_eq(secret.expose_secret().as_bytes(), token_bytes)
+            {
                 return Some("admin".to_string());
             }
         }
@@ -333,12 +442,12 @@ fn is_auth_strictly_configured(config: &ProxyConfig, env_secret: &str) -> bool {
         let has_tokens = auth
             .tokens
             .as_ref()
-            .map(|tk| tk.iter().any(|x| !x.token.is_empty()))
+            .map(|tk| tk.iter().any(|x| !x.token.expose_secret().is_empty()))
             .unwrap_or(false);
         let has_secret = auth
             .secret
             .as_ref()
-            .map(|s| !s.is_empty())
+            .map(|s| !s.expose_secret().is_empty())
             .unwrap_or(false);
         return has_tokens || has_secret;
     }
@@ -346,7 +455,10 @@ fn is_auth_strictly_configured(config: &ProxyConfig, env_secret: &str) -> bool {
 }
 
 enum AuthOutcome {
-    Allowed { role: Option<String>, identity: Option<String> },
+    Allowed {
+        role: Option<String>,
+        identity: Option<String>,
+    },
     Denied(StatusCode, &'static str),
 }
 
@@ -396,14 +508,25 @@ fn authenticate(
                 }
             }
             None => {
-                state.metrics.auth_failures_total.fetch_add(1, Ordering::Relaxed);
-                state.auth_limiter.record_failure(
+                state
+                    .metrics
+                    .auth_failures_total
+                    .fetch_add(1, Ordering::Relaxed);
+                if state.auth_limiter.record_failure(
                     &auth_key,
                     AUTH_FAIL_MAX,
                     AUTH_FAIL_WINDOW,
                     AUTH_FAIL_LOCKOUT,
-                );
-                AuthOutcome::Denied(StatusCode::UNAUTHORIZED, "Client certificate not authorized")
+                ) {
+                    state
+                        .metrics
+                        .auth_lockouts_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                AuthOutcome::Denied(
+                    StatusCode::UNAUTHORIZED,
+                    "Client certificate not authorized",
+                )
             }
         }
     } else {
@@ -416,23 +539,39 @@ fn authenticate(
         let token = match extract_bearer_token(headers) {
             Ok(Some(t)) => t,
             Ok(None) => {
-                state.metrics.auth_failures_total.fetch_add(1, Ordering::Relaxed);
-                state.auth_limiter.record_failure(
+                state
+                    .metrics
+                    .auth_failures_total
+                    .fetch_add(1, Ordering::Relaxed);
+                if state.auth_limiter.record_failure(
                     &auth_key,
                     AUTH_FAIL_MAX,
                     AUTH_FAIL_WINDOW,
                     AUTH_FAIL_LOCKOUT,
-                );
+                ) {
+                    state
+                        .metrics
+                        .auth_lockouts_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 return AuthOutcome::Denied(StatusCode::UNAUTHORIZED, "Missing authorization");
             }
             Err(()) => {
-                state.metrics.auth_failures_total.fetch_add(1, Ordering::Relaxed);
-                state.auth_limiter.record_failure(
+                state
+                    .metrics
+                    .auth_failures_total
+                    .fetch_add(1, Ordering::Relaxed);
+                if state.auth_limiter.record_failure(
                     &auth_key,
                     AUTH_FAIL_MAX,
                     AUTH_FAIL_WINDOW,
                     AUTH_FAIL_LOCKOUT,
-                );
+                ) {
+                    state
+                        .metrics
+                        .auth_lockouts_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 return AuthOutcome::Denied(StatusCode::UNAUTHORIZED, "Malformed authorization");
             }
         };
@@ -446,13 +585,21 @@ fn authenticate(
                 }
             }
             None => {
-                state.metrics.auth_failures_total.fetch_add(1, Ordering::Relaxed);
-                state.auth_limiter.record_failure(
+                state
+                    .metrics
+                    .auth_failures_total
+                    .fetch_add(1, Ordering::Relaxed);
+                if state.auth_limiter.record_failure(
                     &auth_key,
                     AUTH_FAIL_MAX,
                     AUTH_FAIL_WINDOW,
                     AUTH_FAIL_LOCKOUT,
-                );
+                ) {
+                    state
+                        .metrics
+                        .auth_lockouts_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 AuthOutcome::Denied(StatusCode::UNAUTHORIZED, "Invalid token")
             }
         }
@@ -481,19 +628,75 @@ async fn handle(
     let canonical_path = match canonicalize_path(&raw_path) {
         Some(p) => p,
         None => {
-            state.metrics.bad_request_total.fetch_add(1, Ordering::Relaxed);
-            log_request(peer, &method, &raw_path, &user_agent, StatusCode::BAD_REQUEST);
-            return Ok(make_response(StatusCode::BAD_REQUEST, "Malformed request path"));
+            state
+                .metrics
+                .bad_request_total
+                .fetch_add(1, Ordering::Relaxed);
+            log_request(
+                peer,
+                &method,
+                &raw_path,
+                &user_agent,
+                StatusCode::BAD_REQUEST,
+            );
+            return Ok(make_response(
+                StatusCode::BAD_REQUEST,
+                "Malformed request path",
+            ));
         }
     };
 
     if let Some(ref q) = raw_query {
         if q.len() > MAX_PATH_LEN || q.bytes().any(|b| b == 0 || b < 0x20 || b == 0x7f) {
-            state.metrics.bad_request_total.fetch_add(1, Ordering::Relaxed);
-            log_request(peer, &method, &canonical_path, &user_agent, StatusCode::BAD_REQUEST);
-            return Ok(make_response(StatusCode::BAD_REQUEST, "Malformed query string"));
+            state
+                .metrics
+                .bad_request_total
+                .fetch_add(1, Ordering::Relaxed);
+            log_request(
+                peer,
+                &method,
+                &canonical_path,
+                &user_agent,
+                StatusCode::BAD_REQUEST,
+            );
+            return Ok(make_response(
+                StatusCode::BAD_REQUEST,
+                "Malformed query string",
+            ));
         }
     }
+
+    let canonical_path_and_query = match &raw_query {
+        Some(q) => format!("{canonical_path}?{q}"),
+        None => canonical_path.clone(),
+    };
+
+    let config = state.current_config();
+
+    let (user_role, identity) =
+        match authenticate(&state, &config, req.headers(), &peer, cert.as_deref()) {
+            AuthOutcome::Allowed { role, identity } => (role, identity),
+            AuthOutcome::Denied(status, msg) => {
+                state
+                    .metrics
+                    .requests_denied
+                    .fetch_add(1, Ordering::Relaxed);
+                if state.audit.is_enabled() {
+                    let mut ev = AuditEvent::new(
+                        "auth_denied",
+                        peer.ip(),
+                        method.as_str(),
+                        &canonical_path,
+                        &user_agent,
+                    );
+                    ev.status = status.as_u16();
+                    ev.message = Some(msg.to_string());
+                    state.audit.send(ev);
+                }
+                log_request(peer, &method, &canonical_path, &user_agent, status);
+                return Ok(make_response(status, msg));
+            }
+        };
 
     if let Some(ref mp) = state.metrics_path {
         if canonical_path == *mp && method == hyper::Method::GET {
@@ -506,33 +709,13 @@ async fn handle(
         }
     }
 
-    let canonical_path_and_query = match &raw_query {
-        Some(q) => format!("{canonical_path}?{q}"),
-        None => canonical_path.clone(),
-    };
-
-    let config = state.current_config();
-
-    let (user_role, identity) = match authenticate(&state, &config, req.headers(), &peer, cert.as_deref()) {
-        AuthOutcome::Allowed { role, identity } => (role, identity),
-        AuthOutcome::Denied(status, msg) => {
-            state.metrics.requests_denied.fetch_add(1, Ordering::Relaxed);
-            if state.audit.is_enabled() {
-                let mut ev = AuditEvent::new(
-                    "auth_denied",
-                    peer.ip(),
-                    method.as_str(),
-                    &canonical_path,
-                    &user_agent,
-                );
-                ev.status = status.as_u16();
-                ev.message = Some(msg.to_string());
-                state.audit.send(ev);
-            }
-            log_request(peer, &method, &canonical_path, &user_agent, status);
-            return Ok(make_response(status, msg));
-        }
-    };
+    let trusted_proxies: Vec<IpNet> = config
+        .global
+        .as_ref()
+        .and_then(|g| g.trusted_proxies.as_ref())
+        .map(|v| parse_trusted_proxies(v))
+        .unwrap_or_default();
+    let client_ip = compute_client_ip(&peer, req.headers(), &trusted_proxies).to_string();
 
     let upgrade_requested = is_upgrade_request(req.headers());
 
@@ -569,8 +752,6 @@ async fn handle(
         })
         .collect();
 
-    let client_ip = peer.ip().to_string();
-
     let rules = config.rules.as_deref().unwrap_or(&[]);
 
     if upgrade_requested {
@@ -586,7 +767,10 @@ async fn handle(
         let decision = evaluate_request_detailed(rules, &eval_ctx, &state.rate_limiter);
         if let Some(ref rn) = decision.rule_name {
             if decision.dry_run {
-                state.metrics.requests_dry_run.fetch_add(1, Ordering::Relaxed);
+                state
+                    .metrics
+                    .requests_dry_run
+                    .fetch_add(1, Ordering::Relaxed);
                 state.metrics.record_rule_deny(rn, true);
                 if state.audit.is_enabled() {
                     let mut ev = AuditEvent::new(
@@ -606,7 +790,10 @@ async fn handle(
             }
         }
         if let RuleResult::Deny { status, message } = decision.result {
-            state.metrics.requests_denied.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .requests_denied
+                .fetch_add(1, Ordering::Relaxed);
             if let Some(ref rn) = decision.rule_name {
                 state.metrics.record_rule_deny(rn, false);
             }
@@ -630,7 +817,10 @@ async fn handle(
             log_request(peer, &method, &canonical_path, &user_agent, status_code);
             return Ok(make_response_string(status_code, message));
         }
-        state.metrics.requests_allowed.fetch_add(1, Ordering::Relaxed);
+        state
+            .metrics
+            .requests_allowed
+            .fetch_add(1, Ordering::Relaxed);
         return Ok(handle_upgrade(
             req,
             peer,
@@ -651,17 +841,53 @@ async fn handle(
     let body_bytes: Bytes = match timeout(BODY_READ_TIMEOUT, limited.collect()).await {
         Ok(Ok(b)) => b.to_bytes(),
         Ok(Err(e)) => {
-            state.metrics.body_too_large_total.fetch_add(1, Ordering::Relaxed);
+            if e.is::<LengthLimitError>() {
+                state
+                    .metrics
+                    .body_too_large_total
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!("body exceeded size limit");
+                log_request(
+                    peer,
+                    &method,
+                    &canonical_path,
+                    &user_agent,
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                );
+                return Ok(make_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Request body too large",
+                ));
+            }
+            state
+                .metrics
+                .bad_request_total
+                .fetch_add(1, Ordering::Relaxed);
             warn!("body read failed: {e}");
-            log_request(peer, &method, &canonical_path, &user_agent, StatusCode::PAYLOAD_TOO_LARGE);
+            log_request(
+                peer,
+                &method,
+                &canonical_path,
+                &user_agent,
+                StatusCode::BAD_REQUEST,
+            );
             return Ok(make_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "Request body too large or invalid",
+                StatusCode::BAD_REQUEST,
+                "Request body invalid",
             ));
         }
         Err(_) => {
-            state.metrics.upstream_timeouts_total.fetch_add(1, Ordering::Relaxed);
-            log_request(peer, &method, &canonical_path, &user_agent, StatusCode::REQUEST_TIMEOUT);
+            state
+                .metrics
+                .request_timeouts_total
+                .fetch_add(1, Ordering::Relaxed);
+            log_request(
+                peer,
+                &method,
+                &canonical_path,
+                &user_agent,
+                StatusCode::REQUEST_TIMEOUT,
+            );
             return Ok(make_response(
                 StatusCode::REQUEST_TIMEOUT,
                 "Request body read timeout",
@@ -671,7 +897,29 @@ async fn handle(
     let body_json: Option<JsonValue> = if body_bytes.is_empty() {
         None
     } else {
-        serde_json::from_slice(&body_bytes).ok()
+        match serde_json::from_slice(&body_bytes) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                if requires_json_body(&canonical_path) {
+                    state
+                        .metrics
+                        .bad_request_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    log_request(
+                        peer,
+                        &method,
+                        &canonical_path,
+                        &user_agent,
+                        StatusCode::BAD_REQUEST,
+                    );
+                    return Ok(make_response_string(
+                        StatusCode::BAD_REQUEST,
+                        format!("Request body must be valid JSON for this endpoint: {e}"),
+                    ));
+                }
+                None
+            }
+        }
     };
 
     let eval_ctx = EvaluationContext {
@@ -687,7 +935,10 @@ async fn handle(
 
     if decision.dry_run {
         if let Some(ref rn) = decision.rule_name {
-            state.metrics.requests_dry_run.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .requests_dry_run
+                .fetch_add(1, Ordering::Relaxed);
             state.metrics.record_rule_deny(rn, true);
             if state.audit.is_enabled() {
                 let mut ev = AuditEvent::new(
@@ -709,9 +960,15 @@ async fn handle(
 
     match decision.result {
         RuleResult::Deny { status, message } => {
-            state.metrics.requests_denied.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .requests_denied
+                .fetch_add(1, Ordering::Relaxed);
             if decision.action.as_deref() == Some("rate_limit") {
-                state.metrics.rate_limited_total.fetch_add(1, Ordering::Relaxed);
+                state
+                    .metrics
+                    .rate_limited_total
+                    .fetch_add(1, Ordering::Relaxed);
             }
             if let Some(ref rn) = decision.rule_name {
                 state.metrics.record_rule_deny(rn, false);
@@ -744,21 +1001,39 @@ async fn handle(
 
     let upstream_start = Instant::now();
 
-    let unix_stream = match timeout(CONNECT_TIMEOUT, UnixStream::connect(&state.socket_path)).await {
-        Ok(Ok(s)) => s,
+    let upstream_io = match timeout(CONNECT_TIMEOUT, connect_upstream(&state.socket_path)).await {
+        Ok(Ok(io)) => io,
         Ok(Err(e)) => {
-            state.metrics.upstream_errors_total.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .upstream_errors_total
+                .fetch_add(1, Ordering::Relaxed);
             error!("failed to connect to docker socket: {e}");
-            log_request(peer, &method, &canonical_path, &user_agent, StatusCode::BAD_GATEWAY);
+            log_request(
+                peer,
+                &method,
+                &canonical_path,
+                &user_agent,
+                StatusCode::BAD_GATEWAY,
+            );
             return Ok(make_response(
                 StatusCode::BAD_GATEWAY,
                 "docker socket unavailable",
             ));
         }
         Err(_) => {
-            state.metrics.upstream_timeouts_total.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .upstream_timeouts_total
+                .fetch_add(1, Ordering::Relaxed);
             error!("docker socket connect timed out");
-            log_request(peer, &method, &canonical_path, &user_agent, StatusCode::GATEWAY_TIMEOUT);
+            log_request(
+                peer,
+                &method,
+                &canonical_path,
+                &user_agent,
+                StatusCode::GATEWAY_TIMEOUT,
+            );
             return Ok(make_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 "docker socket connect timeout",
@@ -766,19 +1041,27 @@ async fn handle(
         }
     };
 
-    let (mut sender, conn) =
-        match hyper::client::conn::http1::handshake(TokioIo::new(unix_stream)).await {
-            Ok(v) => v,
-            Err(e) => {
-                state.metrics.upstream_errors_total.fetch_add(1, Ordering::Relaxed);
-                error!("docker handshake failed: {e}");
-                log_request(peer, &method, &canonical_path, &user_agent, StatusCode::BAD_GATEWAY);
-                return Ok(make_response(
-                    StatusCode::BAD_GATEWAY,
-                    "docker handshake failed",
-                ));
-            }
-        };
+    let (mut sender, conn) = match hyper::client::conn::http1::handshake(upstream_io).await {
+        Ok(v) => v,
+        Err(e) => {
+            state
+                .metrics
+                .upstream_errors_total
+                .fetch_add(1, Ordering::Relaxed);
+            error!("docker handshake failed: {e}");
+            log_request(
+                peer,
+                &method,
+                &canonical_path,
+                &user_agent,
+                StatusCode::BAD_GATEWAY,
+            );
+            return Ok(make_response(
+                StatusCode::BAD_GATEWAY,
+                "docker handshake failed",
+            ));
+        }
+    };
 
     tokio::spawn(async move {
         if let Err(e) = conn.await {
@@ -800,7 +1083,13 @@ async fn handle(
         Ok(r) => r,
         Err(e) => {
             error!("failed to build upstream request: {e}");
-            log_request(peer, &method, &canonical_path, &user_agent, StatusCode::BAD_GATEWAY);
+            log_request(
+                peer,
+                &method,
+                &canonical_path,
+                &user_agent,
+                StatusCode::BAD_GATEWAY,
+            );
             return Ok(make_response(
                 StatusCode::BAD_GATEWAY,
                 "failed to build upstream request",
@@ -811,17 +1100,35 @@ async fn handle(
     let res = match timeout(UPSTREAM_TIMEOUT, sender.send_request(proxied_req)).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            state.metrics.upstream_errors_total.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .upstream_errors_total
+                .fetch_add(1, Ordering::Relaxed);
             error!("docker request failed: {e}");
-            log_request(peer, &method, &canonical_path, &user_agent, StatusCode::BAD_GATEWAY);
+            log_request(
+                peer,
+                &method,
+                &canonical_path,
+                &user_agent,
+                StatusCode::BAD_GATEWAY,
+            );
             return Ok(make_response(
                 StatusCode::BAD_GATEWAY,
                 "docker request failed",
             ));
         }
         Err(_) => {
-            state.metrics.upstream_timeouts_total.fetch_add(1, Ordering::Relaxed);
-            log_request(peer, &method, &canonical_path, &user_agent, StatusCode::GATEWAY_TIMEOUT);
+            state
+                .metrics
+                .upstream_timeouts_total
+                .fetch_add(1, Ordering::Relaxed);
+            log_request(
+                peer,
+                &method,
+                &canonical_path,
+                &user_agent,
+                StatusCode::GATEWAY_TIMEOUT,
+            );
             return Ok(make_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 "docker upstream timeout",
@@ -845,17 +1152,35 @@ async fn handle(
     let response_bytes = match timeout(UPSTREAM_TIMEOUT, limited_resp.collect()).await {
         Ok(Ok(b)) => b.to_bytes(),
         Ok(Err(e)) => {
-            state.metrics.upstream_errors_total.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .upstream_errors_total
+                .fetch_add(1, Ordering::Relaxed);
             error!("failed to read docker response: {e}");
-            log_request(peer, &method, &canonical_path, &user_agent, StatusCode::BAD_GATEWAY);
+            log_request(
+                peer,
+                &method,
+                &canonical_path,
+                &user_agent,
+                StatusCode::BAD_GATEWAY,
+            );
             return Ok(make_response(
                 StatusCode::BAD_GATEWAY,
                 "failed to read docker response",
             ));
         }
         Err(_) => {
-            state.metrics.upstream_timeouts_total.fetch_add(1, Ordering::Relaxed);
-            log_request(peer, &method, &canonical_path, &user_agent, StatusCode::GATEWAY_TIMEOUT);
+            state
+                .metrics
+                .upstream_timeouts_total
+                .fetch_add(1, Ordering::Relaxed);
+            log_request(
+                peer,
+                &method,
+                &canonical_path,
+                &user_agent,
+                StatusCode::GATEWAY_TIMEOUT,
+            );
             return Ok(make_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 "docker response timeout",
@@ -863,7 +1188,10 @@ async fn handle(
         }
     };
 
-    let elapsed_ms = upstream_start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    let elapsed_ms = upstream_start
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
     state.metrics.observe_upstream_latency_ms(elapsed_ms);
 
     let final_bytes = if !response_filters.is_empty() && content_type.contains("application/json") {
@@ -872,7 +1200,10 @@ async fn handle(
         response_bytes.to_vec()
     };
 
-    state.metrics.requests_allowed.fetch_add(1, Ordering::Relaxed);
+    state
+        .metrics
+        .requests_allowed
+        .fetch_add(1, Ordering::Relaxed);
     log_request(peer, &method, &canonical_path, &user_agent, status);
 
     let mut response_builder = Response::builder().status(status);
@@ -907,6 +1238,7 @@ async fn handle(
     Ok(resp)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_upgrade(
     mut req: Request<Incoming>,
     peer: SocketAddr,
@@ -918,31 +1250,57 @@ async fn handle_upgrade(
     upgrade_value: Option<String>,
     state: Arc<ProxyState>,
 ) -> HttpResponse {
-    let unix_stream = match timeout(CONNECT_TIMEOUT, UnixStream::connect(&state.socket_path)).await {
-        Ok(Ok(s)) => s,
+    let upstream_io = match timeout(CONNECT_TIMEOUT, connect_upstream(&state.socket_path)).await {
+        Ok(Ok(io)) => io,
         Ok(Err(e)) => {
-            state.metrics.upstream_errors_total.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .upstream_errors_total
+                .fetch_add(1, Ordering::Relaxed);
             error!("upgrade: docker connect failed: {e}");
-            log_request(peer, &method, &canonical_path, &user_agent, StatusCode::BAD_GATEWAY);
+            log_request(
+                peer,
+                &method,
+                &canonical_path,
+                &user_agent,
+                StatusCode::BAD_GATEWAY,
+            );
             return make_response(StatusCode::BAD_GATEWAY, "docker socket unavailable");
         }
         Err(_) => {
-            state.metrics.upstream_timeouts_total.fetch_add(1, Ordering::Relaxed);
-            log_request(peer, &method, &canonical_path, &user_agent, StatusCode::GATEWAY_TIMEOUT);
+            state
+                .metrics
+                .upstream_timeouts_total
+                .fetch_add(1, Ordering::Relaxed);
+            log_request(
+                peer,
+                &method,
+                &canonical_path,
+                &user_agent,
+                StatusCode::GATEWAY_TIMEOUT,
+            );
             return make_response(StatusCode::GATEWAY_TIMEOUT, "docker socket connect timeout");
         }
     };
 
-    let (mut sender, conn) =
-        match hyper::client::conn::http1::handshake(TokioIo::new(unix_stream)).await {
-            Ok(v) => v,
-            Err(e) => {
-                state.metrics.upstream_errors_total.fetch_add(1, Ordering::Relaxed);
-                error!("upgrade: docker handshake failed: {e}");
-                log_request(peer, &method, &canonical_path, &user_agent, StatusCode::BAD_GATEWAY);
-                return make_response(StatusCode::BAD_GATEWAY, "docker handshake failed");
-            }
-        };
+    let (mut sender, conn) = match hyper::client::conn::http1::handshake(upstream_io).await {
+        Ok(v) => v,
+        Err(e) => {
+            state
+                .metrics
+                .upstream_errors_total
+                .fetch_add(1, Ordering::Relaxed);
+            error!("upgrade: docker handshake failed: {e}");
+            log_request(
+                peer,
+                &method,
+                &canonical_path,
+                &user_agent,
+                StatusCode::BAD_GATEWAY,
+            );
+            return make_response(StatusCode::BAD_GATEWAY, "docker handshake failed");
+        }
+    };
 
     let conn_with_upgrades = conn.with_upgrades();
     let conn_join = tokio::spawn(async move {
@@ -969,7 +1327,13 @@ async fn handle_upgrade(
         Err(e) => {
             error!("upgrade: build request failed: {e}");
             conn_join.abort();
-            log_request(peer, &method, &canonical_path, &user_agent, StatusCode::BAD_GATEWAY);
+            log_request(
+                peer,
+                &method,
+                &canonical_path,
+                &user_agent,
+                StatusCode::BAD_GATEWAY,
+            );
             return make_response(StatusCode::BAD_GATEWAY, "failed to build upstream request");
         }
     };
@@ -977,16 +1341,34 @@ async fn handle_upgrade(
     let upstream_res = match timeout(UPSTREAM_TIMEOUT, sender.send_request(proxied_req)).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            state.metrics.upstream_errors_total.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .upstream_errors_total
+                .fetch_add(1, Ordering::Relaxed);
             error!("upgrade: send_request failed: {e}");
             conn_join.abort();
-            log_request(peer, &method, &canonical_path, &user_agent, StatusCode::BAD_GATEWAY);
+            log_request(
+                peer,
+                &method,
+                &canonical_path,
+                &user_agent,
+                StatusCode::BAD_GATEWAY,
+            );
             return make_response(StatusCode::BAD_GATEWAY, "docker request failed");
         }
         Err(_) => {
-            state.metrics.upstream_timeouts_total.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .upstream_timeouts_total
+                .fetch_add(1, Ordering::Relaxed);
             conn_join.abort();
-            log_request(peer, &method, &canonical_path, &user_agent, StatusCode::GATEWAY_TIMEOUT);
+            log_request(
+                peer,
+                &method,
+                &canonical_path,
+                &user_agent,
+                StatusCode::GATEWAY_TIMEOUT,
+            );
             return make_response(StatusCode::GATEWAY_TIMEOUT, "docker upstream timeout");
         }
     };
@@ -1026,13 +1408,17 @@ async fn handle_upgrade(
         let client_upgraded = match timeout(UPGRADE_RESOLVE_TIMEOUT, client_upgrade_fut).await {
             Ok(Ok(u)) => u,
             Ok(Err(e)) => {
-                metrics_for_task.upstream_errors_total.fetch_add(1, Ordering::Relaxed);
+                metrics_for_task
+                    .upstream_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("client upgrade failed: {e}");
                 conn_join.abort();
                 return;
             }
             Err(_) => {
-                metrics_for_task.upstream_timeouts_total.fetch_add(1, Ordering::Relaxed);
+                metrics_for_task
+                    .upstream_timeouts_total
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("client upgrade resolve timeout");
                 conn_join.abort();
                 return;
@@ -1041,13 +1427,17 @@ async fn handle_upgrade(
         let docker_upgraded = match timeout(UPGRADE_RESOLVE_TIMEOUT, docker_upgrade_fut).await {
             Ok(Ok(u)) => u,
             Ok(Err(e)) => {
-                metrics_for_task.upstream_errors_total.fetch_add(1, Ordering::Relaxed);
+                metrics_for_task
+                    .upstream_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("docker upgrade failed: {e}");
                 conn_join.abort();
                 return;
             }
             Err(_) => {
-                metrics_for_task.upstream_timeouts_total.fetch_add(1, Ordering::Relaxed);
+                metrics_for_task
+                    .upstream_timeouts_total
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("docker upgrade resolve timeout");
                 conn_join.abort();
                 return;
@@ -1112,9 +1502,12 @@ async fn handle_upgrade(
         .unwrap_or_else(|_| make_response(StatusCode::BAD_GATEWAY, "upgrade response build failed"))
 }
 
-fn init_tracing(log_format: &str) -> Result<(), BoxError> {
-    let filter = tracing_subscriber::EnvFilter::from_default_env()
+fn init_tracing(log_format: &str, log_level: Option<&str>) -> Result<(), BoxError> {
+    let mut filter = tracing_subscriber::EnvFilter::from_default_env()
         .add_directive("docker_proxy=info".parse()?);
+    if let Some(level) = log_level {
+        filter = filter.add_directive(format!("docker_proxy={level}").parse()?);
+    }
     if log_format.eq_ignore_ascii_case("json") {
         tracing_subscriber::fmt()
             .json()
@@ -1175,7 +1568,11 @@ fn render_effective_rules(config: &ProxyConfig) -> String {
                 r.name,
                 r.priority.unwrap_or(0),
                 r.action,
-                if r.dry_run.unwrap_or(false) { ", dry_run" } else { "" }
+                if r.dry_run.unwrap_or(false) {
+                    ", dry_run"
+                } else {
+                    ""
+                }
             ));
         }
     } else {
@@ -1201,8 +1598,58 @@ fn load_config_from_default_path() -> Result<(ProxyConfig, Option<PathBuf>), Str
             let cfg = ProxyConfig::load_from_path(&p)?;
             Ok((cfg, Some(p)))
         }
-        None => Ok((ProxyConfig::load(), None)),
+        None => Ok((ProxyConfig::load()?, None)),
     }
+}
+
+async fn create_listener(
+    config: &ProxyConfig,
+) -> Result<(TcpListener, Option<TlsAcceptor>, String), BoxError> {
+    let port = config
+        .global
+        .as_ref()
+        .and_then(|g| g.port)
+        .or_else(|| {
+            env::var("DOCKER_PROXY_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+        })
+        .unwrap_or(2376);
+
+    let bind_host = config
+        .global
+        .as_ref()
+        .and_then(|g| g.bind.clone())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+
+    let tls_config_opt = config.global.as_ref().and_then(|g| g.tls.clone());
+    if bind_host != "127.0.0.1" && bind_host != "localhost" && tls_config_opt.is_none() {
+        warn!(
+            "binding to non-loopback {} without TLS — tokens will travel in cleartext",
+            bind_host
+        );
+    }
+
+    let tls_acceptor = match tls_config_opt {
+        Some(ref tls_cfg) => {
+            tls::install_default_crypto_provider();
+            let sc = tls::build_server_config(tls_cfg).map_err(|e| {
+                error!("TLS init failed: {e}");
+                e
+            })?;
+            info!(
+                "TLS enabled (cert={}, client_ca={})",
+                tls_cfg.cert,
+                tls_cfg.client_ca.as_deref().unwrap_or("(none)")
+            );
+            Some(TlsAcceptor::from(sc))
+        }
+        None => None,
+    };
+
+    let addr_str = format!("{bind_host}:{port}");
+    let listener = TcpListener::bind(&addr_str).await?;
+    Ok((listener, tls_acceptor, addr_str))
 }
 
 #[tokio::main]
@@ -1266,12 +1713,11 @@ async fn main() -> Result<(), BoxError> {
         return Ok(());
     }
 
-    init_tracing(&log_format)?;
+    let log_level = config.global.as_ref().and_then(|g| g.log_level.as_deref());
+    init_tracing(&log_format, log_level)?;
 
-    if let Some(ref global) = config.global {
-        if let Some(ref level) = global.log_level {
-            info!("config log_level override: {}", level);
-        }
+    if let Some(level) = log_level {
+        info!("config log_level override: {level}");
     }
 
     let config_socket = config.global.as_ref().and_then(|g| g.socket.as_ref());
@@ -1283,11 +1729,12 @@ async fn main() -> Result<(), BoxError> {
         }
     };
 
-    let env_secret = if config.is_auth_configured() {
-        String::new()
-    } else {
-        env::var("DOCKER_PROXY_SECRET").unwrap_or_default()
-    };
+    let env_secret = env::var("DOCKER_PROXY_SECRET").unwrap_or_default();
+    if !env_secret.is_empty()
+        && config.auth.as_ref().and_then(|a| a.auth_type.as_deref()) == Some("none")
+    {
+        warn!("DOCKER_PROXY_SECRET is set but auth.type is 'none'; the secret will be ignored");
+    }
 
     if !is_auth_strictly_configured(&config, &env_secret) {
         error!("auth is not configured — proxy will reject all requests");
@@ -1296,48 +1743,6 @@ async fn main() -> Result<(), BoxError> {
              or set auth.type: none to explicitly disable authentication"
         );
     }
-
-    let port: u16 = config
-        .global
-        .as_ref()
-        .and_then(|g| g.port)
-        .or_else(|| {
-            env::var("DOCKER_PROXY_PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-        })
-        .unwrap_or(2376);
-
-    let bind_host = config
-        .global
-        .as_ref()
-        .and_then(|g| g.bind.clone())
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-
-    let tls_config_opt = config.global.as_ref().and_then(|g| g.tls.clone());
-    if bind_host != "127.0.0.1" && bind_host != "localhost" && tls_config_opt.is_none() {
-        warn!(
-            "binding to non-loopback {} without TLS — tokens will travel in cleartext",
-            bind_host
-        );
-    }
-
-    let tls_acceptor = match tls_config_opt {
-        Some(ref tls_cfg) => {
-            tls::install_default_crypto_provider();
-            let sc = tls::build_server_config(tls_cfg).map_err(|e| {
-                error!("TLS init failed: {e}");
-                e
-            })?;
-            info!(
-                "TLS enabled (cert={}, client_ca={})",
-                tls_cfg.cert,
-                tls_cfg.client_ca.as_deref().unwrap_or("(none)")
-            );
-            Some(TlsAcceptor::from(sc))
-        }
-        None => None,
-    };
 
     let metrics = Arc::new(Metrics::new());
     let metrics_path = config
@@ -1355,11 +1760,7 @@ async fn main() -> Result<(), BoxError> {
         info!("metrics endpoint exposed at {}", p);
     }
 
-    let audit = match config
-        .global
-        .as_ref()
-        .and_then(|g| g.audit_log.clone())
-    {
+    let audit = match config.global.as_ref().and_then(|g| g.audit_log.clone()) {
         Some(p) if !p.is_empty() => {
             info!("audit log enabled at {}", p);
             AuditSink::spawn(PathBuf::from(p))
@@ -1395,54 +1796,78 @@ async fn main() -> Result<(), BoxError> {
         }
     });
 
-    spawn_sighup_reloader(state.clone(), loaded_from.clone());
+    let reload_notify = Arc::new(Notify::new());
+    spawn_sighup_reloader(state.clone(), loaded_from.clone(), reload_notify.clone());
 
-    let addr_str = format!("{bind_host}:{port}");
-    let listener = TcpListener::bind(&addr_str).await?;
-
-    let conn_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNS));
-
-    let cfg = state.current_config();
-    let rule_count = cfg.rules.as_ref().map(|r| r.len()).unwrap_or(0);
-    info!(
-        "docker-proxy listening on {} ({}{} rule{}, log_format={})",
-        addr_str,
-        if tls_acceptor.is_some() { "TLS, " } else { "" },
-        rule_count,
-        if rule_count == 1 { "" } else { "s" },
-        log_format,
-    );
-    drop(cfg);
-
+    let mut first_bind = true;
     loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(v) => v,
+        let config = state.current_config();
+        match create_listener(&config).await {
+            Ok((listener, tls_acceptor, addr_str)) => {
+                let conn_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNS));
+                let rule_count = config.rules.as_ref().map(|r| r.len()).unwrap_or(0);
+                info!(
+                    "docker-proxy listening on {} ({}{} rule{}, log_format={})",
+                    addr_str,
+                    if tls_acceptor.is_some() { "TLS, " } else { "" },
+                    rule_count,
+                    if rule_count == 1 { "" } else { "s" },
+                    log_format,
+                );
+                drop(config);
+
+                let mut reload = false;
+                while !reload {
+                    tokio::select! {
+                        accept_result = listener.accept() => {
+                            match accept_result {
+                                Ok((stream, peer)) => {
+                                    let permit = match conn_sem.clone().try_acquire_owned() {
+                                        Ok(p) => p,
+                                        Err(_) => {
+                                            warn!(
+                                                "connection limit reached — dropping connection from {}",
+                                                peer
+                                            );
+                                            drop(stream);
+                                            continue;
+                                        }
+                                    };
+
+                                    let state = state.clone();
+                                    let tls_acceptor = tls_acceptor.clone();
+
+                                    tokio::spawn(async move {
+                                        let _permit = permit;
+                                        if let Some(acc) = tls_acceptor {
+                                            serve_tls(stream, peer, acc, state).await;
+                                        } else {
+                                            serve_plain(stream, peer, state).await;
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    error!("accept error: {e}");
+                                    continue;
+                                }
+                            }
+                        }
+                        _ = reload_notify.notified() => {
+                            info!("SIGHUP received; restarting listener");
+                            reload = true;
+                        }
+                    }
+                }
+                first_bind = false;
+            }
             Err(e) => {
-                error!("accept error: {e}");
-                continue;
+                if first_bind {
+                    return Err(e);
+                }
+                error!("failed to rebind listener after SIGHUP: {e}");
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
-        };
-
-        let permit = match conn_sem.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => {
-                warn!("connection limit reached — dropping connection from {}", peer);
-                drop(stream);
-                continue;
-            }
-        };
-
-        let state = state.clone();
-        let tls_acceptor = tls_acceptor.clone();
-
-        tokio::spawn(async move {
-            let _permit = permit;
-            if let Some(acc) = tls_acceptor {
-                serve_tls(stream, peer, acc, state).await;
-            } else {
-                serve_plain(stream, peer, state).await;
-            }
-        });
+        }
     }
 }
 
@@ -1500,7 +1925,11 @@ async fn serve_tls(
 }
 
 #[cfg(unix)]
-fn spawn_sighup_reloader(state: Arc<ProxyState>, loaded_from: Option<PathBuf>) {
+fn spawn_sighup_reloader(
+    state: Arc<ProxyState>,
+    loaded_from: Option<PathBuf>,
+    reload_notify: Arc<Notify>,
+) {
     let path = match loaded_from {
         Some(p) => p,
         None => return,
@@ -1522,6 +1951,7 @@ fn spawn_sighup_reloader(state: Arc<ProxyState>, loaded_from: Option<PathBuf>) {
                         let rules_n = cfg.rules.as_ref().map(|r| r.len()).unwrap_or(0);
                         state.swap_config(Arc::new(cfg));
                         info!("config reloaded ({} rules active)", rules_n);
+                        reload_notify.notify_one();
                     }
                     Err(e) => {
                         error!("config reload failed (keeping current): {e}");
@@ -1534,7 +1964,12 @@ fn spawn_sighup_reloader(state: Arc<ProxyState>, loaded_from: Option<PathBuf>) {
 }
 
 #[cfg(not(unix))]
-fn spawn_sighup_reloader(_state: Arc<ProxyState>, _loaded_from: Option<PathBuf>) {}
+fn spawn_sighup_reloader(
+    _state: Arc<ProxyState>,
+    _loaded_from: Option<PathBuf>,
+    _reload_notify: Arc<Notify>,
+) {
+}
 
 #[allow(dead_code)]
 fn _force_ipaddr_use(_: IpAddr) {}

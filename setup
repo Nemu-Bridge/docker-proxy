@@ -110,20 +110,101 @@ download_via_curl() {
     return 1
 }
 
+download_checksums_via_gh() {
+    local tmp="$1"
+    if command -v gh &>/dev/null && gh auth status &>/dev/null 2>&1; then
+        log "Downloading SHA256SUMS via gh CLI ..."
+        gh release download -R "$REPO" -p "SHA256SUMS" -D "$tmp" 2>/dev/null && return 0
+        warn "gh SHA256SUMS download failed"
+    fi
+    return 1
+}
+
+download_checksums_via_curl() {
+    local tag="$1" tmp="$2"
+    local url="https://github.com/${REPO}/releases/download/${tag}/SHA256SUMS"
+    log "Downloading SHA256SUMS from ${url} ..."
+    if command -v curl &>/dev/null; then
+        curl -fSL "$url" -o "$tmp/SHA256SUMS" 2>/dev/null && return 0
+    elif command -v wget &>/dev/null; then
+        wget -q "$url" -O "$tmp/SHA256SUMS" 2>/dev/null && return 0
+    fi
+    return 1
+}
+
+verify_checksum() {
+    local tmp="$1" asset_name="$2"
+    local sums="$tmp/SHA256SUMS"
+    if [ ! -f "$sums" ]; then
+        err "SHA256SUMS not found for release"
+        return 1
+    fi
+    if ! command -v sha256sum &>/dev/null; then
+        err "sha256sum is required for checksum verification"
+        return 1
+    fi
+    local expected
+    expected=$(awk -v name="$asset_name" '$2 == name {print $1}' "$sums")
+    if [ -z "$expected" ]; then
+        err "No checksum found for ${asset_name} in SHA256SUMS"
+        return 1
+    fi
+    local actual
+    actual=$(sha256sum "$tmp/$BIN_NAME" | awk '{print $1}')
+    if [ "$expected" != "$actual" ]; then
+        err "Checksum mismatch for ${asset_name}"
+        err "  expected: ${expected}"
+        err "  actual:   ${actual}"
+        return 1
+    fi
+    log "Checksum verified for ${asset_name}"
+    return 0
+}
+
+download_signature_via_gh() {
+    local tmp="$1"
+    if command -v gh &>/dev/null && gh auth status &>/dev/null 2>&1; then
+        gh release download -R "$REPO" -p "SHA256SUMS.asc" -D "$tmp" 2>/dev/null && return 0
+    fi
+    return 1
+}
+
+download_signature_via_curl() {
+    local tag="$1" tmp="$2"
+    local url="https://github.com/${REPO}/releases/download/${tag}/SHA256SUMS.asc"
+    if command -v curl &>/dev/null; then
+        curl -fSL "$url" -o "$tmp/SHA256SUMS.asc" 2>/dev/null && return 0
+    elif command -v wget &>/dev/null; then
+        wget -q "$url" -O "$tmp/SHA256SUMS.asc" 2>/dev/null && return 0
+    fi
+    return 1
+}
+
+verify_signature() {
+    local tmp="$1"
+    local sig="$tmp/SHA256SUMS.asc"
+    if [ ! -f "$sig" ]; then
+        return 0
+    fi
+    if ! command -v gpg &>/dev/null; then
+        err "SHA256SUMS.asc is present but gpg is not installed"
+        return 1
+    fi
+    if gpg --verify "$sig" "$tmp/SHA256SUMS" >/dev/null 2>&1; then
+        log "GPG signature on SHA256SUMS verified"
+        return 0
+    fi
+    err "GPG signature verification failed for SHA256SUMS"
+    err "Import the project release signing key and try again"
+    return 1
+}
+
 try_clone_and_setup() {
     log "Attempting to clone repository ..."
     local clone_dir
     clone_dir=$(mktemp -d)
 
-    local cloned=0
-    if ssh -T git@github.com 2>&1 | grep -q "successfully authenticated"; then
-        git clone "git@github.com:${REPO}.git" "$clone_dir" 2>/dev/null && cloned=1
-    fi
-    if [ "$cloned" -eq 0 ]; then
-        git clone "https://github.com/${REPO}.git" "$clone_dir" 2>/dev/null && cloned=1
-    fi
-
-    if [ "$cloned" -eq 1 ]; then
+    if git clone "https://github.com/${REPO}.git" "$clone_dir" 2>/dev/null; then
         log "Repository cloned. Running local setup ..."
         cd "$clone_dir"
         if [ -f ./setup ]; then
@@ -152,11 +233,24 @@ download_binary() {
 
     if [ -n "$tag" ]; then
         log "Latest release: ${tag}"
+        local downloaded=0
         if download_via_gh "$os" "$arch" "$tmp" "$asset_name"; then
-            install_binary "$tmp" && return 0
+            downloaded=1
+        elif download_via_curl "$tag" "$asset_name" "$tmp"; then
+            downloaded=1
         fi
-        if download_via_curl "$tag" "$asset_name" "$tmp"; then
-            install_binary "$tmp" && return 0
+
+        if [ "$downloaded" -eq 1 ]; then
+            if download_checksums_via_gh "$tmp" || download_checksums_via_curl "$tag" "$tmp"; then
+                download_signature_via_gh "$tmp" || download_signature_via_curl "$tag" "$tmp" || true
+                if verify_signature "$tmp" && verify_checksum "$tmp" "$asset_name"; then
+                    install_binary "$tmp" && return 0
+                fi
+                return 1
+            else
+                err "Downloaded binary but could not fetch SHA256SUMS for verification"
+                return 1
+            fi
         fi
     else
         warn "Could not determine latest release tag"
@@ -192,8 +286,20 @@ download_binary() {
 install_binary() {
     local tmp="$1"
     chmod +x "$tmp/$BIN_NAME"
-    mv "$tmp/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
-    log "Installed ${BIN_NAME} to ${INSTALL_DIR}/${BIN_NAME}"
+
+    # Verify the binary runs before installing
+    if ! "$tmp/$BIN_NAME" --help >/dev/null 2>&1; then
+        err "Downloaded binary does not execute (wrong architecture or corrupt)"
+        return 1
+    fi
+
+    # Atomic install within the target directory
+    local target="$INSTALL_DIR/$BIN_NAME"
+    local temp_target="${target}.tmp.$$"
+    cp "$tmp/$BIN_NAME" "$temp_target"
+    chmod 755 "$temp_target"
+    mv -f "$temp_target" "$target"
+    log "Installed ${BIN_NAME} to ${target}"
     return 0
 }
 
@@ -202,9 +308,10 @@ write_config() {
     local readonly_token="$2"
 
     mkdir -p "$CONFIG_DIR"
+    chmod 750 "$CONFIG_DIR"
 
     if [ -f "$CONFIG_FILE" ]; then
-        cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
+        cp "$CONFIG_FILE" "${CONFIG_FILE}.bak.$(date +%s)"
     fi
 
     log "Writing config to ${CONFIG_FILE}"
@@ -223,6 +330,171 @@ auth:
       role: readonly
 
 rules:
+  - name: "block-exec-operations"
+    description: Prevent creating or starting exec sessions
+    conditions:
+      - or:
+          - field: path
+            operator: matches
+            value: "^/containers/[^/]+/exec$"
+          - field: path
+            operator: matches
+            value: "^/exec/[^/]+/start$"
+    action: deny
+    message: "Exec operations are not permitted"
+    status: 403
+
+  - name: "block-docker-build"
+    description: Prevent image builds via the API
+    conditions:
+      - field: path
+        operator: starts_with
+        value: "/build"
+    action: deny
+    message: "Image building is not permitted via this proxy"
+
+  - name: "readonly-volumes"
+    description: Only GET is allowed on volumes
+    conditions:
+      - field: path
+        operator: starts_with
+        value: "/volumes"
+      - field: method
+        operator: not_equals
+        value: GET
+    action: deny
+    message: "Volume mutations are forbidden"
+
+  - name: "readonly-networks"
+    description: Only GET is allowed on networks
+    conditions:
+      - field: path
+        operator: starts_with
+        value: "/networks"
+      - field: method
+        operator: not_equals
+        value: GET
+    action: deny
+    message: "Network mutations are forbidden"
+
+  - name: "readonly-images"
+    description: Only GET is allowed on images
+    conditions:
+      - field: path
+        operator: starts_with
+        value: "/images"
+      - field: method
+        operator: not_equals
+        value: GET
+    action: deny
+    message: "Image mutations are forbidden"
+
+  - name: "block-secrets"
+    description: Completely block access to secrets
+    conditions:
+      - field: path
+        operator: starts_with
+        value: "/secrets"
+    action: deny
+    message: "Secrets are not accessible"
+
+  - name: "block-configs"
+    description: Completely block access to configs
+    conditions:
+      - field: path
+        operator: starts_with
+        value: "/configs"
+    action: deny
+    message: "Configs are not accessible"
+
+  - name: "block-privileged-containers"
+    description: Prevent creating containers with --privileged flag
+    conditions:
+      - field: path
+        operator: equals
+        value: "/containers/create"
+      - field: body.HostConfig.Privileged
+        operator: equals
+        value: true
+    action: deny
+    message: "Privileged containers are not allowed"
+    status: 403
+
+  - name: "block-host-network-mode"
+    description: Prevent containers from using host networking
+    conditions:
+      - field: path
+        operator: equals
+        value: "/containers/create"
+      - field: body.HostConfig.NetworkMode
+        operator: equals
+        value: "host"
+    action: deny
+    message: "Host network mode is not allowed"
+    status: 403
+
+  - name: "block-bind-mounts"
+    description: Prevent containers from bind mounting host paths
+    conditions:
+      - field: path
+        operator: equals
+        value: "/containers/create"
+      - or:
+          - field: body.HostConfig.Binds
+            operator: exists
+          - field: body.HostConfig.Mounts
+            operator: matches
+            value: '"Type"\s*:\s*"bind"'
+    action: deny
+    message: "Bind mounts are not allowed"
+    status: 403
+
+  - name: "block-host-pid-namespace"
+    description: Prevent containers from using the host PID namespace
+    conditions:
+      - field: path
+        operator: equals
+        value: "/containers/create"
+      - field: body.HostConfig.PidMode
+        operator: equals
+        value: "host"
+    action: deny
+    message: "Host PID namespace is not allowed"
+    status: 403
+
+  - name: "admin-only-container-lifecycle"
+    description: Only admins can start/stop/restart/kill containers
+    conditions:
+      - field: path
+        operator: matches
+        value: "^/containers/[^/]+/(start|stop|restart|kill|pause|unpause|rename|update)$"
+    action: require_role
+    role: admin
+    message: "Admin role required for container lifecycle operations"
+    status: 403
+
+  - name: "admin-only-create"
+    description: Only admins can create containers
+    conditions:
+      - field: path
+        operator: equals
+        value: "/containers/create"
+    action: require_role
+    role: admin
+    message: "Admin role required to create containers"
+    status: 403
+
+  - name: "admin-only-delete"
+    description: Only admins can delete resources
+    conditions:
+      - field: method
+        operator: equals
+        value: DELETE
+    action: require_role
+    role: admin
+    message: "Admin role required for delete operations"
+    status: 403
+
   - name: "rate-limit-all"
     description: Limit all requests to 50 per 30 seconds, 30s penalty on exceed
     conditions:
@@ -276,7 +548,7 @@ Group=docker
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/etc/docker-proxy
+ReadWritePaths=/etc/docker-proxy /var/log
 PrivateTmp=true
 
 [Install]
@@ -357,15 +629,8 @@ main() {
     fi
 
     echo ""
-    echo -e "  ${BOLD}Your tokens:${NC}"
-    echo ""
-    echo -e "  ${CYAN}Admin (full access):${NC}"
-    echo -e "    ${BOLD}${admin_token}${NC}"
-    echo ""
-    echo -e "  ${CYAN}Readonly (GET only):${NC}"
-    echo -e "    ${BOLD}${readonly_token}${NC}"
-    echo ""
-    echo -e "  ${YELLOW}Save these tokens now. They will not be shown again.${NC}"
+    echo -e "  ${YELLOW}Tokens have been written to ${CONFIG_FILE}.${NC}"
+    echo -e "  ${YELLOW}Retrieve them from that file (readable by root only).${NC}"
     echo ""
 
     if [ "$os" = "linux" ]; then
@@ -395,11 +660,8 @@ main() {
     echo "  Binary:   ${INSTALL_DIR}/${BIN_NAME}"
     echo "  Config:   ${CONFIG_FILE}"
     echo ""
-    echo "  Test (admin):"
-    echo "    curl -H 'Authorization: Bearer ${admin_token}' http://127.0.0.1:2376/version"
-    echo ""
-    echo "  Test (readonly):"
-    echo "    curl -H 'Authorization: Bearer ${readonly_token}' http://127.0.0.1:2376/version"
+    echo "  Test (replace <token> with the value from ${CONFIG_FILE}):"
+    echo "    curl -H 'Authorization: Bearer <admin-token>' http://127.0.0.1:2376/version"
     echo ""
 }
 

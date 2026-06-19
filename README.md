@@ -10,16 +10,37 @@ dependencies beyond the Docker socket it talks to.
 
 ## Quick start
 
+Download the installer, inspect it, and run it as root:
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Nemu-Bridge/docker-proxy/main/setup | sudo bash
+curl -fsSL -o setup https://raw.githubusercontent.com/Nemu-Bridge/docker-proxy/main/setup
+# inspect the script before running
+sudo ./setup
 ```
 
-This downloads the latest binary, generates secure tokens, writes a config to
-`/etc/docker-proxy/config.yaml`, and optionally installs a systemd service
-(Linux). macOS users get manual start instructions printed at the end.
+This downloads the latest release binary, generates secure tokens, writes a
+config to `/etc/docker-proxy/config.yaml`, and optionally installs a systemd
+service (Linux). macOS users get manual start instructions printed at the end.
+
+The project also publishes release checksums; verify the downloaded binary
+against the checksum before installing.
 
 If the download fails (private repo, no `gh` CLI), the script prints the exact
 download URL for your platform and instructions to install manually.
+
+### Verifying release artifacts
+
+Each release publishes a `SHA256SUMS` file. The setup script downloads and
+verifies it automatically. To sign releases with GPG, set
+`DOCKER_PROXY_SIGNING_KEY` to the key ID before running `./update`:
+
+```bash
+export DOCKER_PROXY_SIGNING_KEY="0xYOURKEYID"
+./update
+```
+
+This produces `SHA256SUMS.asc`, which `setup` verifies if the release signing
+key is present in the user's GPG keyring.
 
 To build from source instead:
 
@@ -60,19 +81,21 @@ access is powerful — you should **either**:
 - Restrict access with a firewall (`ufw`, `iptables`, or your cloud provider's
   security group) to only allow trusted IPs.
 
-To use the bundled example config with authentication, copy it and supply a
-token:
+To use the bundled example config with authentication, copy it and set the
+required environment variables:
 
 ```bash
 cp config.yaml my-config.yaml
-# edit my-config.yaml to set your own tokens
+# Tokens must be supplied via environment variables in the example config.
+export ADMIN_TOKEN="$(openssl rand -base64 48)"
+export READONLY_TOKEN="$(openssl rand -base64 48)"
 
 # Admin token (full access)
-curl -H "Authorization: Bearer admin-token-abc123" \
+curl -H "Authorization: Bearer $ADMIN_TOKEN" \
   http://127.0.0.1:2376/containers/json
 
 # Readonly token (GET-only)
-curl -H "Authorization: Bearer readonly-token-xyz789" \
+curl -H "Authorization: Bearer $READONLY_TOKEN" \
   http://127.0.0.1:2376/volumes
 ```
 
@@ -84,7 +107,9 @@ file exists, the proxy runs with all defaults -- no authentication, no rules,
 port 2376, auto-detected Docker socket.
 
 Environment variables can be referenced anywhere in the config using
-`${VARIABLE_NAME}` syntax. Unset variables expand to an empty string.
+`${VARIABLE_NAME}` syntax. For authentication tokens and secrets, a missing
+variable causes the proxy to refuse to start. For other values, unset variables
+expand to an empty string.
 
 ### Top-level structure
 
@@ -106,6 +131,7 @@ rules:         # optional -- ordered access control rules
 | `audit_log` | `string` | -- | Path to an append-only JSON audit log of denied / dry-run / auth-failure events. Each line is a self-contained JSON record. |
 | `tls` | `object` | -- | TLS termination. See below. |
 | `metrics` | `object` | -- | Prometheus metrics endpoint. See below. |
+| `trusted_proxies` | `array` | -- | CIDR list of trusted reverse proxies. When the direct peer matches, `client_ip` rules use `X-Forwarded-For`, `X-Real-Ip`, or `Forwarded`. |
 
 #### `global.tls`
 
@@ -148,7 +174,9 @@ The endpoint emits Prometheus text format (counters + a histogram of upstream la
 
 `docker_proxy_upstream_latency_ms` with buckets: `5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, +Inf`
 
-The metrics endpoint does not require authentication — keep it on a private network or wrap it in TLS.
+The metrics endpoint is served after authentication; a valid bearer token or
+client certificate is required to access it. Keep the metrics path private and
+avoid setting it to a path that overlaps with the Docker API.
 
 ### `auth`
 
@@ -170,7 +198,9 @@ When `auth.type` is `mtls`, the client cert subject is consulted to determine th
 | `cert_role_map` | `array` | Ordered list of `{cn, role}` entries. The cert's CN and SANs are matched against each entry; `*.example.com` wildcards match one label. First match wins. |
 | `default_role` | `string` | Role assigned when no map entry matches and the cert has no CN. |
 
-If neither a map entry matches nor `default_role` is set but the cert has a CN, the CN itself is used as the role string — so a cert with `CN=admin` gets role `admin` automatically. This means you can ship mTLS with no per-cert config and just name your certs after your roles, or use the explicit map for stricter control.
+If no map entry matches, the request is denied unless `default_role` is set.
+The CN is never used as a role automatically; doing so would allow any CA that
+issues arbitrary CNs to grant arbitrary roles.
 
 **Fail-closed defaults.** If no auth section is set, or if `tokens: []` is empty, the proxy refuses every request with 401. To run without authentication you must set `auth.type: none` explicitly. A valid `Authorization: Bearer <token>` header is required when any token or secret is configured. The proxy checks tokens first, then falls back to the shared secret. Token-based roles take precedence.
 
@@ -314,6 +344,11 @@ accumulated from all matching `response_filter` rules but are **not** applied to
 upgrade (streaming) connections — `docker exec`, `attach`, and `logs -f`
 bypass the response filter pipeline.
 
+**Security note:** If you rely on response filters to hide secrets such as
+`Config.Env`, also add a rule that denies `/containers/*/exec` and
+`/exec/*/start`, or an attacker can extract the same data through a streaming
+exec session.
+
 ##### Rate limit config
 
 Used within the `rate_limit` field of a rule with `action: rate_limit`.
@@ -443,7 +478,12 @@ event is immediately flushed to disk for crash consistency.
 
 ## Hot reload
 
-Send `SIGHUP` to the proxy process and it re-reads the same config file it started from. The new rules and auth tables apply to the next accepted request; in-flight connections keep their old config. If the new file fails to parse, the proxy logs an error and keeps running on the previous config.
+Send `SIGHUP` to the proxy process and it re-reads the same config file it
+started from. The listener is closed and rebound using the new `global.bind`,
+`global.port`, and `global.tls` settings, so network and TLS changes take
+effect. In-flight connections are dropped during the brief restart window. If
+the new file fails to parse, the proxy logs an error and keeps running on the
+previous config and listener.
 
 ```bash
 kill -HUP $(pgrep docker-proxy)
@@ -588,6 +628,21 @@ can cover multiple endpoint patterns without duplication.
   action: deny
   message: "Access restricted to internal network"
 ```
+
+When running behind a trusted reverse proxy such as Cloudflare, set
+`global.trusted_proxies`:
+
+```yaml
+global:
+  trusted_proxies:
+    - "10.0.0.0/8"
+    - "103.21.244.0/22"  # example Cloudflare range
+```
+
+If the direct peer matches a trusted proxy CIDR, `client_ip` is taken from
+`X-Real-Ip`, `X-Forwarded-For`, or `Forwarded` (in that order). For
+`X-Forwarded-For`, the rightmost untrusted address is used. If the peer is not
+trusted, proxy headers are ignored and the direct peer IP is used.
 
 ### Redact sensitive response data
 
@@ -805,7 +860,7 @@ The wizard is a separate binary (`docker-proxy-setup`). It walks through:
 
 - Port and socket configuration
 - Authentication (none, shared secret, or per-token roles)
-- 14 built-in rule templates:
+- 15 built-in rule templates:
   1. Block exec operations
   2. Block docker build
   3. Readonly volumes
@@ -816,10 +871,12 @@ The wizard is a separate binary (`docker-proxy-setup`). It walks through:
   8. Block privileged containers
   9. Block bind mounts
   10. Block host network mode
-  11. Admin-only container lifecycle (create, start, stop, delete)
-  12. Internal network only (CIDR whitelist)
-  13. Redact container environment variables from inspect
-  14. Rate limit all requests
+  11. Admin-only container lifecycle
+  12. Admin-only create containers
+  13. Admin-only delete resources
+  14. Internal network only (CIDR whitelist)
+  15. Redact container environment variables from inspect
+  16. Rate limit all requests
 - Custom rule builder with all 5 actions, configurable status codes, multiple
   conditions, rate limit parameters, and response filter values
 

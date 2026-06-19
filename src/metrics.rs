@@ -17,6 +17,7 @@ pub struct Metrics {
     pub upstream_timeouts_total: AtomicU64,
     pub body_too_large_total: AtomicU64,
     pub bad_request_total: AtomicU64,
+    pub request_timeouts_total: AtomicU64,
     pub upgrade_total: AtomicU64,
     by_rule: Mutex<HashMap<String, RuleCounters>>,
     latency: LatencyHistogram,
@@ -70,6 +71,12 @@ impl LatencyHistogram {
     }
 }
 
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Metrics {
     pub fn new() -> Self {
         Metrics {
@@ -84,6 +91,7 @@ impl Metrics {
             upstream_timeouts_total: AtomicU64::new(0),
             body_too_large_total: AtomicU64::new(0),
             bad_request_total: AtomicU64::new(0),
+            request_timeouts_total: AtomicU64::new(0),
             upgrade_total: AtomicU64::new(0),
             by_rule: Mutex::new(HashMap::new()),
             latency: LatencyHistogram::new(),
@@ -113,9 +121,21 @@ impl Metrics {
             self.requests_total.load(Ordering::Relaxed)
         ));
         for (name, label, atomic) in [
-            ("docker_proxy_requests_allowed_total", "allowed", &self.requests_allowed),
-            ("docker_proxy_requests_denied_total", "denied", &self.requests_denied),
-            ("docker_proxy_requests_dry_run_total", "dry_run", &self.requests_dry_run),
+            (
+                "docker_proxy_requests_allowed_total",
+                "allowed",
+                &self.requests_allowed,
+            ),
+            (
+                "docker_proxy_requests_denied_total",
+                "denied",
+                &self.requests_denied,
+            ),
+            (
+                "docker_proxy_requests_dry_run_total",
+                "dry_run",
+                &self.requests_dry_run,
+            ),
         ] {
             out.push_str(&format!("# HELP {name} Requests with outcome '{label}'\n"));
             out.push_str(&format!("# TYPE {name} counter\n"));
@@ -123,14 +143,51 @@ impl Metrics {
         }
 
         for (name, help, atomic) in [
-            ("docker_proxy_auth_failures_total", "Failed auth attempts", &self.auth_failures_total),
-            ("docker_proxy_auth_lockouts_total", "IP auth lockouts triggered", &self.auth_lockouts_total),
-            ("docker_proxy_rate_limited_total", "Requests blocked by rate limit", &self.rate_limited_total),
-            ("docker_proxy_upstream_errors_total", "Upstream docker errors", &self.upstream_errors_total),
-            ("docker_proxy_upstream_timeouts_total", "Upstream docker timeouts", &self.upstream_timeouts_total),
-            ("docker_proxy_body_too_large_total", "Requests rejected for body size", &self.body_too_large_total),
-            ("docker_proxy_bad_request_total", "Requests rejected as malformed", &self.bad_request_total),
-            ("docker_proxy_upgrade_total", "HTTP upgrade (exec/attach) requests proxied", &self.upgrade_total),
+            (
+                "docker_proxy_auth_failures_total",
+                "Failed auth attempts",
+                &self.auth_failures_total,
+            ),
+            (
+                "docker_proxy_auth_lockouts_total",
+                "IP auth lockouts triggered",
+                &self.auth_lockouts_total,
+            ),
+            (
+                "docker_proxy_rate_limited_total",
+                "Requests blocked by rate limit",
+                &self.rate_limited_total,
+            ),
+            (
+                "docker_proxy_upstream_errors_total",
+                "Upstream docker errors",
+                &self.upstream_errors_total,
+            ),
+            (
+                "docker_proxy_upstream_timeouts_total",
+                "Upstream docker timeouts",
+                &self.upstream_timeouts_total,
+            ),
+            (
+                "docker_proxy_body_too_large_total",
+                "Requests rejected for body size",
+                &self.body_too_large_total,
+            ),
+            (
+                "docker_proxy_bad_request_total",
+                "Requests rejected as malformed",
+                &self.bad_request_total,
+            ),
+            (
+                "docker_proxy_request_timeouts_total",
+                "Client request read timeouts",
+                &self.request_timeouts_total,
+            ),
+            (
+                "docker_proxy_upgrade_total",
+                "HTTP upgrade (exec/attach) requests proxied",
+                &self.upgrade_total,
+            ),
         ] {
             out.push_str(&format!("# HELP {name} {help}\n"));
             out.push_str(&format!("# TYPE {name} counter\n"));
@@ -153,11 +210,12 @@ impl Metrics {
         }
         drop(by_rule);
 
-        out.push_str("# HELP docker_proxy_upstream_latency_ms Latency to docker upstream in milliseconds\n");
+        out.push_str(
+            "# HELP docker_proxy_upstream_latency_ms Latency to docker upstream in milliseconds\n",
+        );
         out.push_str("# TYPE docker_proxy_upstream_latency_ms histogram\n");
-        let bucket_snapshots: [u64; LATENCY_BUCKET_COUNT] = std::array::from_fn(|i| {
-            self.latency.buckets[i].load(Ordering::Relaxed)
-        });
+        let bucket_snapshots: [u64; LATENCY_BUCKET_COUNT] =
+            std::array::from_fn(|i| self.latency.buckets[i].load(Ordering::Relaxed));
         let mut cumulative = 0u64;
         for (i, bound) in LATENCY_BUCKETS_MS.iter().enumerate() {
             cumulative = cumulative.saturating_add(bucket_snapshots[i]);
@@ -166,8 +224,7 @@ impl Metrics {
                 bound, cumulative
             ));
         }
-        cumulative = cumulative
-            .saturating_add(bucket_snapshots[LATENCY_BUCKET_COUNT - 1]);
+        cumulative = cumulative.saturating_add(bucket_snapshots[LATENCY_BUCKET_COUNT - 1]);
         out.push_str(&format!(
             "docker_proxy_upstream_latency_ms_bucket{{le=\"+Inf\"}} {}\n",
             cumulative
@@ -207,6 +264,7 @@ mod tests {
         let m = Metrics::new();
         m.requests_total.fetch_add(3, Ordering::Relaxed);
         m.requests_denied.fetch_add(1, Ordering::Relaxed);
+        m.request_timeouts_total.fetch_add(1, Ordering::Relaxed);
         m.record_rule_deny("block-secrets", false);
         m.record_rule_deny("watch-rule", true);
         m.observe_upstream_latency_ms(15);
@@ -214,6 +272,7 @@ mod tests {
         let out = m.render_prometheus();
         assert!(out.contains("docker_proxy_requests_total 3"));
         assert!(out.contains("docker_proxy_requests_denied_total 1"));
+        assert!(out.contains("docker_proxy_request_timeouts_total 1"));
         assert!(out.contains("rule=\"block-secrets\""));
         assert!(out.contains("mode=\"dry_run\""));
         assert!(out.contains("docker_proxy_upstream_latency_ms_count 2"));

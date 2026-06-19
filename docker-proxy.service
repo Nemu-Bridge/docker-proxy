@@ -24,7 +24,7 @@ Group=docker
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/etc/docker-proxy
+ReadWritePaths=/etc/docker-proxy /var/log
 PrivateTmp=true
 
 [Install]

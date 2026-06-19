@@ -42,7 +42,10 @@ mod tests {
     #[test]
     fn test_connection_with_multiple_tokens() {
         let mut h = HeaderMap::new();
-        h.insert("connection", HeaderValue::from_static("keep-alive, Upgrade"));
+        h.insert(
+            "connection",
+            HeaderValue::from_static("keep-alive, Upgrade"),
+        );
         h.insert("upgrade", HeaderValue::from_static("websocket"));
         assert!(is_upgrade_request(&h));
     }

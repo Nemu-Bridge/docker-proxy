@@ -109,7 +109,29 @@ main() {
     fi
 
     echo ""
+    if [ -n "${DOCKER_PROXY_SIGNING_KEY:-}" ]; then
+        if command -v gpg &>/dev/null; then
+            log "Signing SHA256SUMS with GPG key ${DOCKER_PROXY_SIGNING_KEY} ..."
+            gpg --armor --detach-sign --local-user "$DOCKER_PROXY_SIGNING_KEY" \
+                -o "${RELEASE_DIR}/SHA256SUMS.asc" "${RELEASE_DIR}/SHA256SUMS"
+        else
+            err "DOCKER_PROXY_SIGNING_KEY is set but gpg is not installed"
+            exit 1
+        fi
+    fi
+
     log "Creating release ${version} ..."
+    local assets=(
+        "${RELEASE_DIR}/${BIN_NAME}-linux-x86_64"
+        "${RELEASE_DIR}/${BIN_NAME}-linux-aarch64"
+        "${RELEASE_DIR}/${BIN_NAME}-macos-x86_64"
+        "${RELEASE_DIR}/${BIN_NAME}-macos-arm64"
+        "${RELEASE_DIR}/SHA256SUMS"
+    )
+    if [ -f "${RELEASE_DIR}/SHA256SUMS.asc" ]; then
+        assets+=("${RELEASE_DIR}/SHA256SUMS.asc")
+    fi
+
     gh release create "$version" \
         -R "$REPO" \
         --title "$version" \
@@ -122,14 +144,17 @@ Linux builds are statically linked (musl). macOS builds:
 
 Install:
 \`\`\`bash
-curl -fsSL https://raw.githubusercontent.com/${REPO}/main/setup | sudo bash
+curl -fsSL -o setup https://raw.githubusercontent.com/${REPO}/main/setup
+# inspect the script before running
+sudo ./setup
 \`\`\`
+
+Verify downloaded binaries against \`SHA256SUMS\` from the release page. If a
+\`SHA256SUMS.asc\` file is present, verify it with the published release signing
+key before trusting the checksums.
 NOTES
 )" \
-        "${RELEASE_DIR}/${BIN_NAME}-linux-x86_64" \
-        "${RELEASE_DIR}/${BIN_NAME}-linux-aarch64" \
-        "${RELEASE_DIR}/${BIN_NAME}-macos-x86_64" \
-        "${RELEASE_DIR}/${BIN_NAME}-macos-arm64"
+        "${assets[@]}"
 
     log "Release ${version} published."
     echo ""

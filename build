@@ -22,11 +22,9 @@ check_deps() {
     fi
 
     if ! command -v cargo-zigbuild &>/dev/null; then
-        warn "cargo-zigbuild not found, installing ..."
-        cargo install cargo-zigbuild || {
-            err "Failed to install cargo-zigbuild"
-            exit 1
-        }
+        err "cargo-zigbuild is not installed."
+        err "  Install: cargo install cargo-zigbuild"
+        exit 1
     fi
 
     if ! command -v zig &>/dev/null; then
@@ -96,9 +94,20 @@ main() {
     native_arch=$(uname -m)
     if [ "$native_arch" = "arm64" ]; then
         build_target "aarch64-apple-darwin"    "macOS arm64"     "${BIN_NAME}-macos-arm64"
+    elif [ "$native_arch" = "x86_64" ]; then
+        build_target "aarch64-apple-darwin"    "macOS arm64 (cross)" "${BIN_NAME}-macos-arm64"
     else
-        build_target "$native_arch-apple-darwin" "macOS native"  "${BIN_NAME}-macos-arm64"
+        err "Unsupported macOS architecture: $native_arch"
+        exit 1
     fi
+
+    echo ""
+    log "Generating checksums ..."
+    (
+        cd "$RELEASE_DIR"
+        sha256sum ${BIN_NAME}-* > SHA256SUMS
+    )
+    log "  -> ${RELEASE_DIR}/SHA256SUMS"
 
     echo ""
     log "All builds complete."

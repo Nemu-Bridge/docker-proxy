@@ -63,12 +63,11 @@ impl AuditSink {
     pub fn spawn(path: PathBuf) -> Self {
         let (tx, mut rx) = mpsc::channel::<AuditEvent>(4096);
         tokio::spawn(async move {
-            let file = match OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .await
-            {
+            let mut open_opts = OpenOptions::new();
+            open_opts.create(true).append(true);
+            #[cfg(unix)]
+            open_opts.mode(0o600);
+            let file = match open_opts.open(&path).await {
                 Ok(f) => f,
                 Err(e) => {
                     error!("audit log open failed at {}: {e}", path.display());
