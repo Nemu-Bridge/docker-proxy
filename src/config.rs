@@ -440,7 +440,7 @@ impl ProxyConfig {
 
     pub fn sort_rules_by_priority(&mut self) {
         if let Some(ref mut rules) = self.rules {
-            rules.sort_by(|a, b| b.priority.unwrap_or(0).cmp(&a.priority.unwrap_or(0)));
+            rules.sort_by_key(|r| std::cmp::Reverse(r.priority.unwrap_or(0)));
         }
     }
 

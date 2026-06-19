@@ -1944,20 +1944,17 @@ fn spawn_sighup_reloader(
             }
         };
         info!("SIGHUP reload listener installed for {}", path.display());
-        loop {
-            match signal.recv().await {
-                Some(()) => match ProxyConfig::load_from_path(&path) {
-                    Ok(cfg) => {
-                        let rules_n = cfg.rules.as_ref().map(|r| r.len()).unwrap_or(0);
-                        state.swap_config(Arc::new(cfg));
-                        info!("config reloaded ({} rules active)", rules_n);
-                        reload_notify.notify_one();
-                    }
-                    Err(e) => {
-                        error!("config reload failed (keeping current): {e}");
-                    }
-                },
-                None => break,
+        while let Some(()) = signal.recv().await {
+            match ProxyConfig::load_from_path(&path) {
+                Ok(cfg) => {
+                    let rules_n = cfg.rules.as_ref().map(|r| r.len()).unwrap_or(0);
+                    state.swap_config(Arc::new(cfg));
+                    info!("config reloaded ({} rules active)", rules_n);
+                    reload_notify.notify_one();
+                }
+                Err(e) => {
+                    error!("config reload failed (keeping current): {e}");
+                }
             }
         }
     });
