@@ -10,16 +10,90 @@ dependencies beyond the Docker socket it talks to.
 
 ## Quick start
 
+One command, run as root:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Nemu-Bridge/docker-proxy/main/setup | sudo bash
 ```
 
-This downloads the latest binary, generates secure tokens, writes a config to
-`/etc/docker-proxy/config.yaml`, and optionally installs a systemd service
-(Linux). macOS users get manual start instructions printed at the end.
+That's it. The proxy is now running on `127.0.0.1:2376`.
 
-If the download fails (private repo, no `gh` CLI), the script prints the exact
-download URL for your platform and instructions to install manually.
+Prefer to read the script before running it as root (recommended)? Download it
+first, inspect it, then run:
+
+```bash
+curl -fsSL -o setup https://raw.githubusercontent.com/Nemu-Bridge/docker-proxy/main/setup
+less setup
+sudo ./setup
+```
+
+The installer downloads the latest release binary for your platform, verifies
+it against the published `SHA256SUMS`, generates secure admin and readonly
+tokens, writes a config to `/etc/docker-proxy/config.yaml`, and (on Linux)
+installs and starts a systemd service. macOS users get manual start
+instructions printed at the end. If the download fails (private repo, no `gh`
+CLI), the script prints the exact download URL for your platform and manual
+install instructions.
+
+### Your tokens (the only secrets you store)
+
+Setup generates two bearer tokens and writes them into
+`/etc/docker-proxy/config.yaml` (mode `640`, readable by root only). You don't
+create them - you just read them back and hand them to whatever talks to the
+proxy:
+
+```bash
+sudo grep -A1 'role: admin'    /etc/docker-proxy/config.yaml   # admin token (full access)
+sudo grep -A1 'role: readonly' /etc/docker-proxy/config.yaml   # readonly token (GET-only)
+```
+
+Use a token by sending it as a Bearer header:
+
+```bash
+curl -H "Authorization: Bearer <admin-token>" http://127.0.0.1:2376/version
+docker -H tcp://127.0.0.1:2376 ps   # for a docker client, pass the token via your client config
+```
+
+Treat these like passwords. Rotate them by editing the config and restarting
+the service (see below).
+
+### Changing the configuration
+
+Everything is in `/etc/docker-proxy/config.yaml` - port, bind address, Docker
+socket path, auth, and the ordered access rules. To change anything:
+
+```bash
+sudo nano /etc/docker-proxy/config.yaml      # edit port / rules / tokens
+docker-proxy --check-config                   # validate before applying
+sudo systemctl restart docker-proxy           # apply the change
+journalctl -u docker-proxy -f                 # watch it come back up
+```
+
+The rule syntax and every available knob are documented in
+[Configuration file](#configuration-file) below.
+
+### Verifying release artifacts
+
+Each release publishes a `SHA256SUMS` file. The setup script downloads and
+verifies it automatically - this is the default and requires nothing from the
+user.
+
+Releases can additionally be GPG-signed. The automated release pipeline signs
+`SHA256SUMS` into `SHA256SUMS.asc` whenever the `GPG_PRIVATE_KEY` and
+`GPG_PASSPHRASE` repository secrets are configured (see
+[Releasing](#releasing)). For a local/manual release, set
+`DOCKER_PROXY_SIGNING_KEY` to the key ID before running `./update`:
+
+```bash
+export DOCKER_PROXY_SIGNING_KEY="0xYOURKEYID"
+./update
+```
+
+When a `SHA256SUMS.asc` is present, `setup` verifies it - but only succeeds if
+the release signing key is already imported into the user's GPG keyring, and
+**aborts the install if verification fails**. Only enable signing once you also
+publish and document the public key, otherwise it breaks the one-command
+install for everyone who hasn't imported it.
 
 To build from source instead:
 
@@ -54,25 +128,27 @@ global:
 ```
 
 The proxy logs a warning when binding off-loopback without TLS. Docker API
-access is powerful — you should **either**:
+access is powerful - you should **either**:
 
 - Configure TLS (`global.tls`) so traffic is encrypted and authenticated.
 - Restrict access with a firewall (`ufw`, `iptables`, or your cloud provider's
   security group) to only allow trusted IPs.
 
-To use the bundled example config with authentication, copy it and supply a
-token:
+To use the bundled example config with authentication, copy it and set the
+required environment variables:
 
 ```bash
 cp config.yaml my-config.yaml
-# edit my-config.yaml to set your own tokens
+# Tokens must be supplied via environment variables in the example config.
+export ADMIN_TOKEN="$(openssl rand -base64 48)"
+export READONLY_TOKEN="$(openssl rand -base64 48)"
 
 # Admin token (full access)
-curl -H "Authorization: Bearer admin-token-abc123" \
+curl -H "Authorization: Bearer $ADMIN_TOKEN" \
   http://127.0.0.1:2376/containers/json
 
 # Readonly token (GET-only)
-curl -H "Authorization: Bearer readonly-token-xyz789" \
+curl -H "Authorization: Bearer $READONLY_TOKEN" \
   http://127.0.0.1:2376/volumes
 ```
 
@@ -84,93 +160,100 @@ file exists, the proxy runs with all defaults -- no authentication, no rules,
 port 2376, auto-detected Docker socket.
 
 Environment variables can be referenced anywhere in the config using
-`${VARIABLE_NAME}` syntax. Unset variables expand to an empty string.
+`${VARIABLE_NAME}` syntax. For authentication tokens and secrets, a missing
+variable causes the proxy to refuse to start. For other values, unset variables
+expand to an empty string.
 
 ### Top-level structure
 
 ```yaml
-global:        # optional -- override defaults
-auth:          # optional -- authentication configuration
-rules:         # optional -- ordered access control rules
+global: # optional -- override defaults
+auth: # optional -- authentication configuration
+rules: # optional -- ordered access control rules
 ```
 
 ### `global`
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `port` | `u16` | `2376` | TCP port the proxy binds to. Overrides `DOCKER_PROXY_PORT`. |
-| `bind` | `string` | `127.0.0.1` | Host/IP to bind. Use `0.0.0.0` only with TLS configured; the proxy logs a loud warning if you bind off-loopback without TLS. |
-| `socket` | `string` | auto | Path to the Docker Unix socket. Overrides `DOCKER_SOCKET`. |
-| `log_level` | `string` | `info` | Log level filter (`trace`, `debug`, `info`, `warn`, `error`). |
-| `log_format` | `string` | `text` | `text` for human logs, `json` for structured one-line-per-event output suitable for Loki/Elasticsearch. |
-| `audit_log` | `string` | -- | Path to an append-only JSON audit log of denied / dry-run / auth-failure events. Each line is a self-contained JSON record. |
-| `tls` | `object` | -- | TLS termination. See below. |
-| `metrics` | `object` | -- | Prometheus metrics endpoint. See below. |
+| Key               | Type     | Default     | Description                                                                                                                               |
+| ----------------- | -------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `port`            | `u16`    | `2376`      | TCP port the proxy binds to. Overrides `DOCKER_PROXY_PORT`.                                                                               |
+| `bind`            | `string` | `127.0.0.1` | Host/IP to bind. Use `0.0.0.0` only with TLS configured; the proxy logs a loud warning if you bind off-loopback without TLS.              |
+| `socket`          | `string` | auto        | Path to the Docker Unix socket. Overrides `DOCKER_SOCKET`.                                                                                |
+| `log_level`       | `string` | `info`      | Log level filter (`trace`, `debug`, `info`, `warn`, `error`).                                                                             |
+| `log_format`      | `string` | `text`      | `text` for human logs, `json` for structured one-line-per-event output suitable for Loki/Elasticsearch.                                   |
+| `audit_log`       | `string` | --          | Path to an append-only JSON audit log of denied / dry-run / auth-failure events. Each line is a self-contained JSON record.               |
+| `tls`             | `object` | --          | TLS termination. See below.                                                                                                               |
+| `metrics`         | `object` | --          | Prometheus metrics endpoint. See below.                                                                                                   |
+| `trusted_proxies` | `array`  | --          | CIDR list of trusted reverse proxies. When the direct peer matches, `client_ip` rules use `X-Forwarded-For`, `X-Real-Ip`, or `Forwarded`. |
 
 #### `global.tls`
 
 When set, the listener is wrapped in rustls (ring backend, TLS 1.2+1.3). Clients must speak HTTPS.
 
-| Key | Type | Description |
-|-----|------|-------------|
-| `cert` | `string` | Path to a PEM-encoded server certificate chain. |
-| `key` | `string` | Path to a PEM-encoded private key (PKCS#8, PKCS#1, or SEC1). |
-| `client_ca` | `string` | Optional. Path to a PEM bundle of CAs used to verify client certificates. Enables mTLS. |
-| `require_client_cert` | `bool` | When `true`, the TLS handshake fails unless the client presents a valid cert. Defaults to `false` (optional client cert). |
+| Key                   | Type     | Description                                                                                                               |
+| --------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `cert`                | `string` | Path to a PEM-encoded server certificate chain.                                                                           |
+| `key`                 | `string` | Path to a PEM-encoded private key (PKCS#8, PKCS#1, or SEC1).                                                              |
+| `client_ca`           | `string` | Optional. Path to a PEM bundle of CAs used to verify client certificates. Enables mTLS.                                   |
+| `require_client_cert` | `bool`   | When `true`, the TLS handshake fails unless the client presents a valid cert. Defaults to `false` (optional client cert). |
 
 #### `global.metrics`
 
-| Key | Type | Description |
-|-----|------|-------------|
-| `enabled` | `bool` | Set `true` to expose the metrics endpoint on the proxy port. |
-| `path` | `string` | URL path the metrics live at. Defaults to `/metrics`. |
+| Key       | Type     | Description                                                  |
+| --------- | -------- | ------------------------------------------------------------ |
+| `enabled` | `bool`   | Set `true` to expose the metrics endpoint on the proxy port. |
+| `path`    | `string` | URL path the metrics live at. Defaults to `/metrics`.        |
 
 The endpoint emits Prometheus text format (counters + a histogram of upstream latency).
 
 **Counters:**
 
-| Metric | Description |
-|--------|-------------|
-| `docker_proxy_requests_total` | Total requests received |
-| `docker_proxy_requests_allowed_total` | Requests explicitly allowed (past the rule engine) |
-| `docker_proxy_requests_denied_total` | Requests denied by rule or auth |
-| `docker_proxy_requests_dry_run_total` | Requests matched by dry-run rules (allowed but logged) |
-| `docker_proxy_auth_failures_total` | Failed authentication attempts |
-| `docker_proxy_auth_lockouts_total` | IP-based auth lockouts triggered |
-| `docker_proxy_rate_limited_total` | Requests denied due to rate limiting |
-| `docker_proxy_upgrade_total` | Successful upgrade connections (exec/attach/logs) |
-| `docker_proxy_upstream_errors_total` | Docker connection or handshake failures |
-| `docker_proxy_upstream_timeouts_total` | Docker upstream timeouts |
-| `docker_proxy_body_too_large_total` | Requests rejected for exceeding 10 MB body limit |
-| `docker_proxy_rule_decisions_total{rule, mode}` | Per-rule deny/dry_run counts |
+| Metric                                          | Description                                            |
+| ----------------------------------------------- | ------------------------------------------------------ |
+| `docker_proxy_requests_total`                   | Total requests received                                |
+| `docker_proxy_requests_allowed_total`           | Requests explicitly allowed (past the rule engine)     |
+| `docker_proxy_requests_denied_total`            | Requests denied by rule or auth                        |
+| `docker_proxy_requests_dry_run_total`           | Requests matched by dry-run rules (allowed but logged) |
+| `docker_proxy_auth_failures_total`              | Failed authentication attempts                         |
+| `docker_proxy_auth_lockouts_total`              | IP-based auth lockouts triggered                       |
+| `docker_proxy_rate_limited_total`               | Requests denied due to rate limiting                   |
+| `docker_proxy_upgrade_total`                    | Successful upgrade connections (exec/attach/logs)      |
+| `docker_proxy_upstream_errors_total`            | Docker connection or handshake failures                |
+| `docker_proxy_upstream_timeouts_total`          | Docker upstream timeouts                               |
+| `docker_proxy_body_too_large_total`             | Requests rejected for exceeding 10 MB body limit       |
+| `docker_proxy_rule_decisions_total{rule, mode}` | Per-rule deny/dry_run counts                           |
 
 **Histogram:**
 
 `docker_proxy_upstream_latency_ms` with buckets: `5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, +Inf`
 
-The metrics endpoint does not require authentication — keep it on a private network or wrap it in TLS.
+The metrics endpoint is served after authentication; a valid bearer token or
+client certificate is required to access it. Keep the metrics path private and
+avoid setting it to a path that overlaps with the Docker API.
 
 ### `auth`
 
 Controls how incoming requests are authenticated.
 
-| Key | Type | Description |
-|-----|------|-------------|
-| `type` | `string` | Auth scheme. `bearer` enforces Bearer token auth. `none` disables auth entirely. `mtls` uses the client TLS certificate as the identity. |
-| `secret` | `string` | A shared Bearer token. Authenticated clients receive the `admin` role. Supports env interpolation (`"${MY_SECRET}"`). |
-| `tokens` | `array` | Per-token configuration for fine-grained role assignment. |
-| `mtls` | `object` | Settings used when `type: mtls`. See below. |
+| Key      | Type     | Description                                                                                                                              |
+| -------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `type`   | `string` | Auth scheme. `bearer` enforces Bearer token auth. `none` disables auth entirely. `mtls` uses the client TLS certificate as the identity. |
+| `secret` | `string` | A shared Bearer token. Authenticated clients receive the `admin` role. Supports env interpolation (`"${MY_SECRET}"`).                    |
+| `tokens` | `array`  | Per-token configuration for fine-grained role assignment.                                                                                |
+| `mtls`   | `object` | Settings used when `type: mtls`. See below.                                                                                              |
 
 #### `auth.mtls`
 
 When `auth.type` is `mtls`, the client cert subject is consulted to determine the role.
 
-| Key | Type | Description |
-|-----|------|-------------|
-| `cert_role_map` | `array` | Ordered list of `{cn, role}` entries. The cert's CN and SANs are matched against each entry; `*.example.com` wildcards match one label. First match wins. |
-| `default_role` | `string` | Role assigned when no map entry matches and the cert has no CN. |
+| Key             | Type     | Description                                                                                                                                               |
+| --------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cert_role_map` | `array`  | Ordered list of `{cn, role}` entries. The cert's CN and SANs are matched against each entry; `*.example.com` wildcards match one label. First match wins. |
+| `default_role`  | `string` | Role assigned when no map entry matches and the cert has no CN.                                                                                           |
 
-If neither a map entry matches nor `default_role` is set but the cert has a CN, the CN itself is used as the role string — so a cert with `CN=admin` gets role `admin` automatically. This means you can ship mTLS with no per-cert config and just name your certs after your roles, or use the explicit map for stricter control.
+If no map entry matches, the request is denied unless `default_role` is set.
+The CN is never used as a role automatically; doing so would allow any CA that
+issues arbitrary CNs to grant arbitrary roles.
 
 **Fail-closed defaults.** If no auth section is set, or if `tokens: []` is empty, the proxy refuses every request with 401. To run without authentication you must set `auth.type: none` explicitly. A valid `Authorization: Bearer <token>` header is required when any token or secret is configured. The proxy checks tokens first, then falls back to the shared secret. Token-based roles take precedence.
 
@@ -178,10 +261,10 @@ Failed auth attempts are tracked **per source IP** (not per token). 10 failures 
 
 Each entry under `tokens`:
 
-| Key | Type | Description |
-|-----|------|-------------|
+| Key     | Type     | Description                                         |
+| ------- | -------- | --------------------------------------------------- |
 | `token` | `string` | The Bearer token value. Supports env interpolation. |
-| `role` | `string` | Role assigned to this token (default: `user`). |
+| `role`  | `string` | Role assigned to this token (default: `user`).      |
 
 **Environment variable overrides.** `DOCKER_PROXY_SECRET` overrides `auth.secret`
 
@@ -198,18 +281,18 @@ If no rule matches, the request is allowed.
 
 #### Rule fields
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `name` | `string` | required | Human-readable identifier. |
-| `description` | `string` | -- | Optional description of what the rule does. |
-| `action` | `string` | required | One of `deny`, `allow`, `require_role`, `response_filter`. |
-| `conditions` | `array` | `[]` | List of conditions. All must evaluate true for the rule to fire. |
-| `message` | `string` | -- | Custom response body returned when the rule blocks a request. |
-| `status` | `u16` | `403` | HTTP status code for blocked requests. |
-| `role` | `string` | `admin` | Required role for `require_role` action. |
-| `response_filter` | `array` | -- | List of filter entries. Used only with `action: response_filter`. |
-| `priority` | `u32` | `0` | Higher priority rules are evaluated first. Rules with equal priority keep their declaration order (stable sort). |
-| `dry_run` | `bool` | `false` | When `true`, a rule that would otherwise deny instead allows the request through and emits an audit-log event tagged `dry_run`. Useful for rolling out new policies. |
+| Key               | Type     | Default  | Description                                                                                                                                                          |
+| ----------------- | -------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`            | `string` | required | Human-readable identifier.                                                                                                                                           |
+| `description`     | `string` | --       | Optional description of what the rule does.                                                                                                                          |
+| `action`          | `string` | required | One of `deny`, `allow`, `require_role`, `response_filter`.                                                                                                           |
+| `conditions`      | `array`  | `[]`     | List of conditions. All must evaluate true for the rule to fire.                                                                                                     |
+| `message`         | `string` | --       | Custom response body returned when the rule blocks a request.                                                                                                        |
+| `status`          | `u16`    | `403`    | HTTP status code for blocked requests.                                                                                                                               |
+| `role`            | `string` | `admin`  | Required role for `require_role` action.                                                                                                                             |
+| `response_filter` | `array`  | --       | List of filter entries. Used only with `action: response_filter`.                                                                                                    |
+| `priority`        | `u32`    | `0`      | Higher priority rules are evaluated first. Rules with equal priority keep their declaration order (stable sort).                                                     |
+| `dry_run`         | `bool`   | `false`  | When `true`, a rule that would otherwise deny instead allows the request through and emits an audit-log event tagged `dry_run`. Useful for rolling out new policies. |
 
 #### Conditions
 
@@ -218,30 +301,30 @@ to compare, and an optional `value` to compare against.
 
 ##### Condition fields
 
-| Field | Description |
-|-------|-------------|
-| `path` | The request path (e.g. `/containers/json`). |
-| `method` | The HTTP method (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`). |
-| `client_ip` | The connecting client's IP address. |
-| `header.<name>` | A specific request header. `<name>` is case-insensitive. |
-| `body.<path>` | A field within the parsed JSON request body. `<path>` uses dot notation for nested objects (e.g. `HostConfig.Privileged`) and numeric indices for array elements (e.g. `Env.0`). |
+| Field           | Description                                                                                                                                                                      |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `path`          | The request path (e.g. `/containers/json`).                                                                                                                                      |
+| `method`        | The HTTP method (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`).                                                                                                               |
+| `client_ip`     | The connecting client's IP address.                                                                                                                                              |
+| `header.<name>` | A specific request header. `<name>` is case-insensitive.                                                                                                                         |
+| `body.<path>`   | A field within the parsed JSON request body. `<path>` uses dot notation for nested objects (e.g. `HostConfig.Privileged`) and numeric indices for array elements (e.g. `Env.0`). |
 
 ##### Condition operators
 
-| Operator | Applies To | Description |
-|----------|-----------|-------------|
-| `equals` | all | Exact value match. For `body` fields, compares typed values (strings, booleans, numbers). |
-| `not_equals` | all | Negation of `equals`. |
-| `contains` | path, header, body | Substring match. |
-| `not_contains` | path, header, body | Negation of `contains`. |
-| `starts_with` | path, header, body | Prefix match. |
-| `ends_with` | path, header | Suffix match. |
-| `matches` | path, header, body | Regex match (Rust regex syntax). |
-| `not_matches` | path, header | Negation of `matches`. |
-| `in` | all | Value is present in a YAML list. For `client_ip`, list entries are parsed as CIDR ranges. |
-| `not_in` | all | Value is absent from a YAML list. CIDR-aware for `client_ip`. |
-| `exists` | header, body | The field exists or is present in the JSON body. |
-| `not_exists` | header, body | The field is missing or absent from the JSON body. |
+| Operator       | Applies To         | Description                                                                               |
+| -------------- | ------------------ | ----------------------------------------------------------------------------------------- |
+| `equals`       | all                | Exact value match. For `body` fields, compares typed values (strings, booleans, numbers). |
+| `not_equals`   | all                | Negation of `equals`.                                                                     |
+| `contains`     | path, header, body | Substring match.                                                                          |
+| `not_contains` | path, header, body | Negation of `contains`.                                                                   |
+| `starts_with`  | path, header, body | Prefix match.                                                                             |
+| `ends_with`    | path, header       | Suffix match.                                                                             |
+| `matches`      | path, header, body | Regex match (Rust regex syntax).                                                          |
+| `not_matches`  | path, header       | Negation of `matches`.                                                                    |
+| `in`           | all                | Value is present in a YAML list. For `client_ip`, list entries are parsed as CIDR ranges. |
+| `not_in`       | all                | Value is absent from a YAML list. CIDR-aware for `client_ip`.                             |
+| `exists`       | header, body       | The field exists or is present in the JSON body.                                          |
+| `not_exists`   | header, body       | The field is missing or absent from the JSON body.                                        |
 
 ##### Condition Grouping (AND / OR)
 
@@ -290,39 +373,44 @@ supported and continue to behave as before.
 
 ##### Actions
 
-| Action | Terminating? | Description |
-|--------|-------------|-------------|
-| `deny` | yes | Blocks the request immediately with the configured `status` and `message`. |
-| `allow` | yes | Explicitly allows the request, short-circuiting further rule evaluation. Useful for carving out exceptions ordered before broad deny rules. |
-| `require_role` | yes | Blocks the request if the authenticated user's role is not `admin` and does not match the rule's required `role`. The `admin` role always passes. |
-| `response_filter` | no | Allows the request but applies JSON transformations to the Docker response body. Filters from multiple matching rules accumulate. Only applied when the response `content-type` is `application/json`. |
-| `rate_limit` | yes (when exceeded) | Enforces a token-bucket rate limit per client IP. If the bucket has tokens available, the request continues and 1 token is consumed. If the bucket is empty, the request is denied with `status` (default `429`). When the limit is not exceeded, evaluation continues to the next rule. |
+| Action            | Terminating?        | Description                                                                                                                                                                                                                                                                              |
+| ----------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `deny`            | yes                 | Blocks the request immediately with the configured `status` and `message`.                                                                                                                                                                                                               |
+| `allow`           | yes                 | Explicitly allows the request, short-circuiting further rule evaluation. Useful for carving out exceptions ordered before broad deny rules.                                                                                                                                              |
+| `require_role`    | yes                 | Blocks the request if the authenticated user's role is not `admin` and does not match the rule's required `role`. The `admin` role always passes.                                                                                                                                        |
+| `response_filter` | no                  | Allows the request but applies JSON transformations to the Docker response body. Filters from multiple matching rules accumulate. Only applied when the response `content-type` is `application/json`.                                                                                   |
+| `rate_limit`      | yes (when exceeded) | Enforces a token-bucket rate limit per client IP. If the bucket has tokens available, the request continues and 1 token is consumed. If the bucket is empty, the request is denied with `status` (default `429`). When the limit is not exceeded, evaluation continues to the next rule. |
 
 ##### Response filter entries
 
 Used within the `response_filter` array of a rule.
 
-| Key | Type | Description |
-|-----|------|-------------|
-| `field` | `string` | Dot-notation path to the JSON field to modify (e.g. `Config.Env`, `Items.0.Name`). Supports array indices. |
-| `action` | `string` | `redact` (replace with `***REDACTED***`), `remove` (delete the field), or `replace` (set to `replacement`). |
-| `replacement` | `string` | Replacement value for the `replace` action. |
+| Key           | Type     | Description                                                                                                 |
+| ------------- | -------- | ----------------------------------------------------------------------------------------------------------- |
+| `field`       | `string` | Dot-notation path to the JSON field to modify (e.g. `Config.Env`, `Items.0.Name`). Supports array indices.  |
+| `action`      | `string` | `redact` (replace with `***REDACTED***`), `remove` (delete the field), or `replace` (set to `replacement`). |
+| `replacement` | `string` | Replacement value for the `replace` action.                                                                 |
 
 Response filters only apply when the Docker response `content-type` is
 `application/json`. Non-JSON responses pass through unchanged. Filters are
 accumulated from all matching `response_filter` rules but are **not** applied to
-upgrade (streaming) connections — `docker exec`, `attach`, and `logs -f`
+upgrade (streaming) connections - `docker exec`, `attach`, and `logs -f`
 bypass the response filter pipeline.
+
+**Security note:** If you rely on response filters to hide secrets such as
+`Config.Env`, also add a rule that denies `/containers/*/exec` and
+`/exec/*/start`, or an attacker can extract the same data through a streaming
+exec session.
 
 ##### Rate limit config
 
 Used within the `rate_limit` field of a rule with `action: rate_limit`.
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `requests` | `u64` | `50` | Maximum requests allowed in the window (bucket capacity). |
-| `period` | `u64` | `30` | Window size in seconds. Tokens refill at `requests / period` per second. |
-| `penalty` | `u64` | `30` | Cooldown in seconds after hitting the limit. Once the bucket empties, the client is blocked for this many seconds. After the penalty expires, the bucket resets to full capacity. |
+| Key        | Type  | Default | Description                                                                                                                                                                       |
+| ---------- | ----- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `requests` | `u64` | `50`    | Maximum requests allowed in the window (bucket capacity).                                                                                                                         |
+| `period`   | `u64` | `30`    | Window size in seconds. Tokens refill at `requests / period` per second.                                                                                                          |
+| `penalty`  | `u64` | `30`    | Cooldown in seconds after hitting the limit. Once the bucket empties, the client is blocked for this many seconds. After the penalty expires, the bucket resets to full capacity. |
 
 The limiter uses a per-rule, per-client-IP token bucket. Each client starts
 with a full bucket. Every request consumes 1 token. Tokens refill continuously.
@@ -398,24 +486,24 @@ Every HTTP request to the proxy opens a **new** Unix socket connection to
 Docker with `connection: close` (no connection reuse). The proxy enforces these
 limits:
 
-| Limit | Value | Behavior |
-|-------|-------|----------|
-| Request body | 10 MB | Exceeding returns `413 Payload Too Large` |
-| Response body | 64 MB | Exceeding returns `502 Bad Gateway` |
-| Concurrent connections | 1,024 | Additional connections are dropped with a warning |
-| Path length | 8,192 bytes | Longer paths return `400 Bad Request` |
-| Token length | 4,096 bytes | Longer tokens are rejected |
-| Rate-limit buckets | 16,384 distinct IPs | New IPs beyond this cap are denied |
-| Auth-lockout keys | 16,384 distinct IPs | New IPs beyond this cap are not tracked |
+| Limit                  | Value               | Behavior                                          |
+| ---------------------- | ------------------- | ------------------------------------------------- |
+| Request body           | 10 MB               | Exceeding returns `413 Payload Too Large`         |
+| Response body          | 64 MB               | Exceeding returns `502 Bad Gateway`               |
+| Concurrent connections | 1,024               | Additional connections are dropped with a warning |
+| Path length            | 8,192 bytes         | Longer paths return `400 Bad Request`             |
+| Token length           | 4,096 bytes         | Longer tokens are rejected                        |
+| Rate-limit buckets     | 16,384 distinct IPs | New IPs beyond this cap are denied                |
+| Auth-lockout keys      | 16,384 distinct IPs | New IPs beyond this cap are not tracked           |
 
-| Timeout | Value | Applies to |
-|---------|-------|------------|
-| Docker socket connect | 5 s | Unix socket connection to Docker |
-| Request body read | 30 s | Client sending the request body |
-| Docker upstream response | 300 s (5 min) | Docker processing and sending the response |
-| TLS handshake | 10 s | TLS negotiation |
-| Upgrade resolve | 30 s | 101 Switching Protocols handshake |
-| Upgrade idle | 3,600 s (1 hr) | Streaming connections with no traffic |
+| Timeout                  | Value          | Applies to                                 |
+| ------------------------ | -------------- | ------------------------------------------ |
+| Docker socket connect    | 5 s            | Unix socket connection to Docker           |
+| Request body read        | 30 s           | Client sending the request body            |
+| Docker upstream response | 300 s (5 min)  | Docker processing and sending the response |
+| TLS handshake            | 10 s           | TLS negotiation                            |
+| Upgrade resolve          | 30 s           | 101 Switching Protocols handshake          |
+| Upgrade idle             | 3,600 s (1 hr) | Streaming connections with no traffic      |
 
 ## Streaming (`docker exec`, `attach`, `logs -f`)
 
@@ -432,7 +520,21 @@ Endpoints that upgrade to a raw TCP stream are forwarded transparently. The prox
 If `global.audit_log` is set, the proxy spawns a writer task that appends one JSON record per line for each denied, dry-run, or auth-failure event:
 
 ```json
-{"timestamp":"2026-05-12T19:09:18Z","event":"deny","peer_ip":"10.0.0.5","method":"POST","path":"/containers/create","user_agent":"docker/24.0","user_role":"readonly","identity":null,"rule_name":"admin-only-create","rule_action":"require_role","status":403,"dry_run":false,"message":"Admin role required to create containers"}
+{
+  "timestamp": "2026-05-12T19:09:18Z",
+  "event": "deny",
+  "peer_ip": "10.0.0.5",
+  "method": "POST",
+  "path": "/containers/create",
+  "user_agent": "docker/24.0",
+  "user_role": "readonly",
+  "identity": null,
+  "rule_name": "admin-only-create",
+  "rule_action": "require_role",
+  "status": 403,
+  "dry_run": false,
+  "message": "Admin role required to create containers"
+}
 ```
 
 Event types: `deny` (rule blocked), `auth_denied` (auth failure), `dry_run` (would-be deny logged but allowed through).
@@ -443,7 +545,12 @@ event is immediately flushed to disk for crash consistency.
 
 ## Hot reload
 
-Send `SIGHUP` to the proxy process and it re-reads the same config file it started from. The new rules and auth tables apply to the next accepted request; in-flight connections keep their old config. If the new file fails to parse, the proxy logs an error and keeps running on the previous config.
+Send `SIGHUP` to the proxy process and it re-reads the same config file it
+started from. The listener is closed and rebound using the new `global.bind`,
+`global.port`, and `global.tls` settings, so network and TLS changes take
+effect. In-flight connections are dropped during the brief restart window. If
+the new file fails to parse, the proxy logs an error and keeps running on the
+previous config and listener.
 
 ```bash
 kill -HUP $(pgrep docker-proxy)
@@ -459,11 +566,11 @@ Running with defaults does not spawn the reloader.
 docker-proxy [--config <path>] [--check-config]
 ```
 
-| Flag | Description |
-|------|-------------|
-| `--config <path>` | Path to the YAML config (overrides `DOCKER_PROXY_CONFIG`). |
-| `--check-config` | Parse the config, print the effective rule set sorted by priority, exit. Returns non-zero if parsing fails. Use in CI before deploys. |
-| `--help`, `-h` | Print usage and exit. |
+| Flag              | Description                                                                                                                           |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `--config <path>` | Path to the YAML config (overrides `DOCKER_PROXY_CONFIG`).                                                                            |
+| `--check-config`  | Parse the config, print the effective rule set sorted by priority, exit. Returns non-zero if parsing fails. Use in CI before deploys. |
+| `--help`, `-h`    | Print usage and exit.                                                                                                                 |
 
 ## Logging
 
@@ -476,7 +583,7 @@ and the peer IP, method, path, user agent, and status code. Paths are truncated
 to 256 characters and control characters are sanitized.
 
 System events (config reloads, TLS errors, etc.) use the tracing subscriber
-without timestamps — only request/response lines carry the manual timestamp.
+without timestamps - only request/response lines carry the manual timestamp.
 When shipping logs to Loki or Elasticsearch, attach the collection timestamp
 for system events.
 
@@ -589,6 +696,21 @@ can cover multiple endpoint patterns without duplication.
   message: "Access restricted to internal network"
 ```
 
+When running behind a trusted reverse proxy such as Cloudflare, set
+`global.trusted_proxies`:
+
+```yaml
+global:
+  trusted_proxies:
+    - "10.0.0.0/8"
+    - "103.21.244.0/22" # example Cloudflare range
+```
+
+If the direct peer matches a trusted proxy CIDR, `client_ip` is taken from
+`X-Real-Ip`, `X-Forwarded-For`, or `Forwarded` (in that order). For
+`X-Forwarded-For`, the rightmost untrusted address is used. If the peer is not
+trusted, proxy headers are ignored and the direct peer IP is used.
+
 ### Redact sensitive response data
 
 ```yaml
@@ -646,7 +768,7 @@ For endpoint-specific limits, narrow the `path` condition:
 
 ```yaml
 - name: "watch-image-pulls"
-  description: Log image pulls but don't block — yet
+  description: Log image pulls but don't block - yet
   priority: 100
   conditions:
     - field: path
@@ -724,37 +846,39 @@ rule, so health checks pass while everything else is blocked.
 
 ## Environment variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DOCKER_PROXY_CONFIG` | Path to the YAML configuration file. | `./config.yaml` |
-| `DOCKER_PROXY_SECRET` | Shared Bearer token. Overrides `auth.secret` (unless `auth.type: none`). | (none) |
-| `DOCKER_PROXY_PORT` | TCP listen port. Overridden by `global.port` if set. | `2376` |
-| `DOCKER_SOCKET` | Path to the Docker Unix socket. Overridden by `global.socket` if the path exists. | auto-detected |
-| `RUST_LOG` | Tracing log filter. Overrides `global.log_level`. | `docker_proxy=info` |
+| Variable              | Description                                                                       | Default             |
+| --------------------- | --------------------------------------------------------------------------------- | ------------------- |
+| `DOCKER_PROXY_CONFIG` | Path to the YAML configuration file.                                              | `./config.yaml`     |
+| `DOCKER_PROXY_SECRET` | Shared Bearer token. Overrides `auth.secret` (unless `auth.type: none`).          | (none)              |
+| `DOCKER_PROXY_PORT`   | TCP listen port. Overridden by `global.port` if set.                              | `2376`              |
+| `DOCKER_SOCKET`       | Path to the Docker Unix socket. Overridden by `global.socket` if the path exists. | auto-detected       |
+| `RUST_LOG`            | Tracing log filter. Overrides `global.log_level`.                                 | `docker_proxy=info` |
 
 Socket auto-detection order:
+
 - macOS: `~/.docker/run/docker.sock`, `/var/run/docker.sock`, `~/.docker/desktop/docker.sock`
 - Linux: `/var/run/docker.sock`, `/run/docker.sock`
 
 **Override precedence** (highest to lowest):
 
-1. CLI `--config <path>` — sets `DOCKER_PROXY_CONFIG`
+1. CLI `--config <path>` - sets `DOCKER_PROXY_CONFIG`
 2. `DOCKER_PROXY_PORT` / `DOCKER_SOCKET` / `DOCKER_PROXY_SECRET` env vars
 3. `${ENV_VAR}` interpolation in YAML values
 4. YAML file values
-5. `RUST_LOG` — overrides `global.log_level`
+5. `RUST_LOG` - overrides `global.log_level`
 6. Built-in defaults
 
 ## Scripts
 
-| Script | Purpose |
-|--------|---------|
-| `setup` | Download binary, generate config, install service. Detects OS/arch. |
-| `build` | Cross-compile for all 4 targets (linux x86_64, linux aarch64, macos x86_64, macos arm64). |
-| `update` | Publish built binaries as a GitHub release. Bumps version automatically. |
-| `uninstall` | Stop and remove the service, binary, and config directory (with confirmation). |
+| Script      | Purpose                                                                                   |
+| ----------- | ----------------------------------------------------------------------------------------- |
+| `setup`     | Download binary, generate config, install service. Detects OS/arch.                       |
+| `build`     | Cross-compile for all 4 targets (linux x86_64, linux aarch64, macos x86_64, macos arm64). |
+| `update`    | Publish built binaries as a GitHub release. Bumps version automatically.                  |
+| `uninstall` | Stop and remove the service, binary, and config directory (with confirmation).            |
 
-**Release workflow:**
+The `build` and `update` scripts are the **manual / offline** path. The normal
+release path is fully automated - see [Releasing](#releasing).
 
 ```bash
 ./build                    # compiles all 4 targets into release/
@@ -762,6 +886,40 @@ Socket auto-detection order:
 ```
 
 Requires `cargo-zigbuild`, `zig`, and `gh` CLI authenticated.
+
+## Continuous integration
+
+Two GitHub Actions workflows live in `.github/workflows/`:
+
+| Workflow      | Trigger                                     | What it does                                                                                                                                                                                                                                                                                |
+| ------------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ci.yml`      | push / PR to `main` or `canary`             | `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, bash script syntax checks, a cross-compile build matrix, and an end-to-end `api_e2e` job that runs the proxy against the runner's real Docker socket and asserts auth + a deny rule + the metrics endpoint behave correctly. |
+| `release.yml` | push of a `v*.*.*` tag (or manual dispatch) | Cross-compiles all 4 targets, generates `SHA256SUMS`, optionally GPG-signs, and publishes a GitHub Release with the assets - the same artifact layout `setup` expects.                                                                                                                      |
+
+## Releasing
+
+Releases are automated. To cut one, tag a commit and push the tag:
+
+```bash
+git tag v1.0.1
+git push origin v1.0.1
+```
+
+`release.yml` then builds every target, checksums them, optionally signs, and
+publishes the release. No local toolchain, no `gh` login, no running `./build`
+or `./update` by hand.
+
+**Repository secrets:**
+
+| Secret            | Required? | Purpose                                                                |
+| ----------------- | --------- | ---------------------------------------------------------------------- |
+| `GITHUB_TOKEN`    | automatic | Provided by Actions; used to create the release. Nothing to configure. |
+| `GPG_PRIVATE_KEY` | optional  | ASCII-armored private key. When set, the pipeline signs `SHA256SUMS`.  |
+| `GPG_PASSPHRASE`  | optional  | Passphrase for that key.                                               |
+
+Leave the GPG secrets unset for a frictionless, checksum-only install (the
+recommended default). The manual `./build` + `./update` scripts remain available
+for local or offline releases.
 
 ## systemd service
 
@@ -805,7 +963,7 @@ The wizard is a separate binary (`docker-proxy-setup`). It walks through:
 
 - Port and socket configuration
 - Authentication (none, shared secret, or per-token roles)
-- 14 built-in rule templates:
+- 15 built-in rule templates:
   1. Block exec operations
   2. Block docker build
   3. Readonly volumes
@@ -816,10 +974,12 @@ The wizard is a separate binary (`docker-proxy-setup`). It walks through:
   8. Block privileged containers
   9. Block bind mounts
   10. Block host network mode
-  11. Admin-only container lifecycle (create, start, stop, delete)
-  12. Internal network only (CIDR whitelist)
-  13. Redact container environment variables from inspect
-  14. Rate limit all requests
+  11. Admin-only container lifecycle
+  12. Admin-only create containers
+  13. Admin-only delete resources
+  14. Internal network only (CIDR whitelist)
+  15. Redact container environment variables from inspect
+  16. Rate limit all requests
 - Custom rule builder with all 5 actions, configurable status codes, multiple
   conditions, rate limit parameters, and response filter values
 
@@ -833,14 +993,14 @@ The binary is at `target/release/docker-proxy`.
 
 ## Dependencies
 
-| Crate | Purpose |
-|-------|---------|
-| `tokio` | Async runtime |
-| `hyper` + `hyper-util` | HTTP server and client (Unix socket transport) |
-| `http-body-util` | Request/response body utilities |
-| `tracing` + `tracing-subscriber` | Structured logging |
-| `serde` + `serde_yaml` | YAML config parsing |
-| `serde_json` | JSON body inspection and response filtering |
-| `regex` | Pattern matching in rule conditions |
-| `ipnet` | CIDR matching for IP-based rules |
-| `chrono` | Request log timestamps |
+| Crate                            | Purpose                                        |
+| -------------------------------- | ---------------------------------------------- |
+| `tokio`                          | Async runtime                                  |
+| `hyper` + `hyper-util`           | HTTP server and client (Unix socket transport) |
+| `http-body-util`                 | Request/response body utilities                |
+| `tracing` + `tracing-subscriber` | Structured logging                             |
+| `serde` + `serde_yaml`           | YAML config parsing                            |
+| `serde_json`                     | JSON body inspection and response filtering    |
+| `regex`                          | Pattern matching in rule conditions            |
+| `ipnet`                          | CIDR matching for IP-based rules               |
+| `chrono`                         | Request log timestamps                         |

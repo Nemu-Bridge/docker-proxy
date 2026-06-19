@@ -1,8 +1,8 @@
+use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Password, Select};
 use docker_proxy::config::{
     AuthConfig, Condition, ConditionNode, GlobalConfig, ProxyConfig, RateLimitConfig,
-    ResponseFilterEntry, Rule, TokenEntry,
+    ResponseFilterEntry, Rule, SecretToken, TokenEntry,
 };
-use dialoguer::{Confirm, Input, MultiSelect, Select, theme::ColorfulTheme};
 use std::fs;
 
 fn main() {
@@ -29,7 +29,11 @@ fn main() {
         .unwrap();
     println!();
 
-    let auth_types = vec!["none -- no authentication", "bearer -- single shared secret", "tokens -- per-token roles"];
+    let auth_types = vec![
+        "none -- no authentication",
+        "bearer -- single shared secret",
+        "tokens -- per-token roles",
+    ];
     let auth_choice = Select::with_theme(&theme)
         .with_prompt("Authentication type")
         .items(&auth_types)
@@ -49,7 +53,7 @@ fn main() {
             println!();
             Some(AuthConfig {
                 auth_type: Some("bearer".to_string()),
-                secret: Some(secret),
+                secret: Some(SecretToken::new(secret)),
                 tokens: None,
                 mtls: None,
             })
@@ -66,9 +70,9 @@ fn main() {
             let mut tokens: Vec<TokenEntry> = Vec::new();
             loop {
                 println!("--- Add Token ---");
-                let token: String = Input::with_theme(&theme)
+                let token: String = Password::with_theme(&theme)
                     .with_prompt("Token value")
-                    .interact_text()
+                    .interact()
                     .unwrap();
                 let roles = vec!["admin", "readonly", "user"];
                 let role_idx = Select::with_theme(&theme)
@@ -78,7 +82,7 @@ fn main() {
                     .interact()
                     .unwrap();
                 tokens.push(TokenEntry {
-                    token,
+                    token: SecretToken::new(token),
                     role: Some(roles[role_idx].to_string()),
                 });
                 println!();
@@ -93,11 +97,19 @@ fn main() {
                 println!();
             }
 
-            let secret_opt = if secret.is_empty() { None } else { Some(secret) };
+            let secret_opt = if secret.is_empty() {
+                None
+            } else {
+                Some(SecretToken::new(secret))
+            };
             Some(AuthConfig {
                 auth_type: Some("bearer".to_string()),
                 secret: secret_opt,
-                tokens: if tokens.is_empty() { None } else { Some(tokens) },
+                tokens: if tokens.is_empty() {
+                    None
+                } else {
+                    Some(tokens)
+                },
                 mtls: None,
             })
         }
@@ -106,7 +118,11 @@ fn main() {
 
     let global = Some(GlobalConfig {
         port: Some(port),
-        socket: if socket_path.is_empty() { None } else { Some(socket_path) },
+        socket: if socket_path.is_empty() {
+            None
+        } else {
+            Some(socket_path)
+        },
         ..GlobalConfig::default()
     });
 
@@ -159,19 +175,24 @@ fn main() {
                         description: Some("Prevent creating or starting exec sessions".to_string()),
                         action: "deny".to_string(),
                         conditions: vec![ConditionNode::Or {
-                            or: vec![ConditionNode::Leaf(Condition {
-                                field: "path".to_string(),
-                                operator: "matches".to_string(),
-                                value: Some(serde_yaml::Value::String(
-                                    "^/containers/[^/]+/exec$".to_string(),
-                                )),
-                            }), ConditionNode::Leaf(Condition {
-                                field: "path".to_string(),
-                                operator: "matches".to_string(),
-                                value: Some(serde_yaml::Value::String(
-                                    "^/exec/[^/]+/start$".to_string(),
-                                )),
-                            })],
+                            or: vec![
+                                ConditionNode::Leaf(Condition {
+                                    compiled_regex: None,
+                                    field: "path".to_string(),
+                                    operator: "matches".to_string(),
+                                    value: Some(serde_yaml::Value::String(
+                                        "^/containers/[^/]+/exec$".to_string(),
+                                    )),
+                                }),
+                                ConditionNode::Leaf(Condition {
+                                    compiled_regex: None,
+                                    field: "path".to_string(),
+                                    operator: "matches".to_string(),
+                                    value: Some(serde_yaml::Value::String(
+                                        "^/exec/[^/]+/start$".to_string(),
+                                    )),
+                                }),
+                            ],
                         }],
                         message: Some("Exec operations are not permitted".to_string()),
                         status: Some(403),
@@ -180,7 +201,9 @@ fn main() {
                     rules.push(build_simple_deny(
                         "block-docker-build",
                         "Prevent image builds via the API",
-                        "path", "starts_with", "/build",
+                        "path",
+                        "starts_with",
+                        "/build",
                         "Image building is not permitted via this proxy",
                     ));
                 }
@@ -195,28 +218,40 @@ fn main() {
                 }
                 4 => {
                     rules.push(build_simple_deny(
-                        "block-secrets", "Block access to secrets",
-                        "path", "starts_with", "/secrets",
+                        "block-secrets",
+                        "Block access to secrets",
+                        "path",
+                        "starts_with",
+                        "/secrets",
                         "Secrets are not accessible",
                     ));
                     rules.push(build_simple_deny(
-                        "block-configs", "Block access to configs",
-                        "path", "starts_with", "/configs",
+                        "block-configs",
+                        "Block access to configs",
+                        "path",
+                        "starts_with",
+                        "/configs",
                         "Configs are not accessible",
                     ));
                 }
                 5 => {
                     rules.push(Rule {
                         name: "block-privileged-containers".to_string(),
-                        description: Some("Prevent creating containers with --privileged".to_string()),
+                        description: Some(
+                            "Prevent creating containers with --privileged".to_string(),
+                        ),
                         action: "deny".to_string(),
                         conditions: vec![
                             ConditionNode::Leaf(Condition {
+                                compiled_regex: None,
                                 field: "path".to_string(),
                                 operator: "equals".to_string(),
-                                value: Some(serde_yaml::Value::String("/containers/create".to_string())),
+                                value: Some(serde_yaml::Value::String(
+                                    "/containers/create".to_string(),
+                                )),
                             }),
                             ConditionNode::Leaf(Condition {
+                                compiled_regex: None,
                                 field: "body.HostConfig.Privileged".to_string(),
                                 operator: "equals".to_string(),
                                 value: Some(serde_yaml::Value::Bool(true)),
@@ -234,15 +269,31 @@ fn main() {
                         action: "deny".to_string(),
                         conditions: vec![
                             ConditionNode::Leaf(Condition {
+                                compiled_regex: None,
                                 field: "path".to_string(),
                                 operator: "equals".to_string(),
-                                value: Some(serde_yaml::Value::String("/containers/create".to_string())),
+                                value: Some(serde_yaml::Value::String(
+                                    "/containers/create".to_string(),
+                                )),
                             }),
-                            ConditionNode::Leaf(Condition {
-                                field: "body.HostConfig.Binds".to_string(),
-                                operator: "exists".to_string(),
-                                value: None,
-                            }),
+                            ConditionNode::Or {
+                                or: vec![
+                                    ConditionNode::Leaf(Condition {
+                                        compiled_regex: None,
+                                        field: "body.HostConfig.Binds".to_string(),
+                                        operator: "exists".to_string(),
+                                        value: None,
+                                    }),
+                                    ConditionNode::Leaf(Condition {
+                                        compiled_regex: None,
+                                        field: "body.HostConfig.Mounts".to_string(),
+                                        operator: "matches".to_string(),
+                                        value: Some(serde_yaml::Value::String(
+                                            "\"Type\"\\s*:\\s*\"bind\"".to_string(),
+                                        )),
+                                    }),
+                                ],
+                            },
                         ],
                         message: Some("Bind mounts are not allowed".to_string()),
                         status: Some(403),
@@ -252,15 +303,21 @@ fn main() {
                 7 => {
                     rules.push(Rule {
                         name: "block-host-network".to_string(),
-                        description: Some("Prevent containers from using host networking".to_string()),
+                        description: Some(
+                            "Prevent containers from using host networking".to_string(),
+                        ),
                         action: "deny".to_string(),
                         conditions: vec![
                             ConditionNode::Leaf(Condition {
+                                compiled_regex: None,
                                 field: "path".to_string(),
                                 operator: "equals".to_string(),
-                                value: Some(serde_yaml::Value::String("/containers/create".to_string())),
+                                value: Some(serde_yaml::Value::String(
+                                    "/containers/create".to_string(),
+                                )),
                             }),
                             ConditionNode::Leaf(Condition {
+                                compiled_regex: None,
                                 field: "body.HostConfig.NetworkMode".to_string(),
                                 operator: "equals".to_string(),
                                 value: Some(serde_yaml::Value::String("host".to_string())),
@@ -276,7 +333,7 @@ fn main() {
                         name: "admin-only-container-lifecycle".to_string(),
                         description: Some("Only admins can start/stop/restart/kill containers".to_string()),
                         action: "require_role".to_string(),
-                        conditions: vec![ConditionNode::Leaf(Condition {
+                        conditions: vec![ConditionNode::Leaf(Condition { compiled_regex: None,
                             field: "path".to_string(),
                             operator: "matches".to_string(),
                             value: Some(serde_yaml::Value::String(
@@ -295,9 +352,12 @@ fn main() {
                         description: Some("Only admins can create containers".to_string()),
                         action: "require_role".to_string(),
                         conditions: vec![ConditionNode::Leaf(Condition {
+                            compiled_regex: None,
                             field: "path".to_string(),
                             operator: "equals".to_string(),
-                            value: Some(serde_yaml::Value::String("/containers/create".to_string())),
+                            value: Some(serde_yaml::Value::String(
+                                "/containers/create".to_string(),
+                            )),
                         })],
                         role: Some("admin".to_string()),
                         message: Some("Admin role required to create containers".to_string()),
@@ -311,6 +371,7 @@ fn main() {
                         description: Some("Only admins can delete resources".to_string()),
                         action: "require_role".to_string(),
                         conditions: vec![ConditionNode::Leaf(Condition {
+                            compiled_regex: None,
                             field: "method".to_string(),
                             operator: "equals".to_string(),
                             value: Some(serde_yaml::Value::String("DELETE".to_string())),
@@ -324,9 +385,12 @@ fn main() {
                 11 => {
                     rules.push(Rule {
                         name: "internal-network-only".to_string(),
-                        description: Some("Restrict access to private network ranges and localhost".to_string()),
+                        description: Some(
+                            "Restrict access to private network ranges and localhost".to_string(),
+                        ),
                         action: "deny".to_string(),
                         conditions: vec![ConditionNode::Leaf(Condition {
+                            compiled_regex: None,
                             field: "client_ip".to_string(),
                             operator: "not_in".to_string(),
                             value: Some(serde_yaml::Value::Sequence(vec![
@@ -344,9 +408,13 @@ fn main() {
                 12 => {
                     rules.push(Rule {
                         name: "redact-container-environment".to_string(),
-                        description: Some("Redact environment variables and commands from container inspect".to_string()),
+                        description: Some(
+                            "Redact environment variables and commands from container inspect"
+                                .to_string(),
+                        ),
                         action: "response_filter".to_string(),
                         conditions: vec![ConditionNode::Leaf(Condition {
+                            compiled_regex: None,
                             field: "path".to_string(),
                             operator: "matches".to_string(),
                             value: Some(serde_yaml::Value::String(
@@ -371,9 +439,13 @@ fn main() {
                 13 => {
                     rules.push(Rule {
                         name: "rate-limit-all".to_string(),
-                        description: Some("Limit requests to 50 per 30 seconds, 30s penalty on exceed".to_string()),
+                        description: Some(
+                            "Limit requests to 50 per 30 seconds, 30s penalty on exceed"
+                                .to_string(),
+                        ),
                         action: "rate_limit".to_string(),
                         conditions: vec![ConditionNode::Leaf(Condition {
+                            compiled_regex: None,
                             field: "path".to_string(),
                             operator: "matches".to_string(),
                             value: Some(serde_yaml::Value::String("^/".to_string())),
@@ -383,17 +455,17 @@ fn main() {
                             period: 30,
                             penalty: 30,
                         }),
-                        message: Some("Rate limit exceeded. You are blocked for 30 seconds.".to_string()),
+                        message: Some(
+                            "Rate limit exceeded. You are blocked for 30 seconds.".to_string(),
+                        ),
                         status: Some(429),
                         ..Rule::default()
                     });
                 }
-                14 => {
-                    match build_custom_rule(&theme) {
-                        Some(rule) => rules.push(rule),
-                        None => println!("  (custom rule cancelled)"),
-                    }
-                }
+                14 => match build_custom_rule(&theme) {
+                    Some(rule) => rules.push(rule),
+                    None => println!("  (custom rule cancelled)"),
+                },
                 _ => {}
             }
         }
@@ -420,7 +492,10 @@ fn main() {
 
     println!();
     println!("  config.yaml written successfully.");
-    println!("  {} rules configured.", config.rules.as_ref().map(|r| r.len()).unwrap_or(0));
+    println!(
+        "  {} rules configured.",
+        config.rules.as_ref().map(|r| r.len()).unwrap_or(0)
+    );
     println!();
     println!("  Run with:  cargo run");
     println!("  Or:        DOCKER_PROXY_CONFIG=./config.yaml cargo run");
@@ -440,6 +515,7 @@ fn build_simple_deny(
         description: Some(description.to_string()),
         action: "deny".to_string(),
         conditions: vec![ConditionNode::Leaf(Condition {
+            compiled_regex: None,
             field: field.to_string(),
             operator: operator.to_string(),
             value: Some(serde_yaml::Value::String(value.to_string())),
@@ -458,11 +534,13 @@ fn build_readonly(name: &str, prefix: &str) -> Rule {
         action: "deny".to_string(),
         conditions: vec![
             ConditionNode::Leaf(Condition {
+                compiled_regex: None,
                 field: "path".to_string(),
                 operator: "starts_with".to_string(),
                 value: Some(serde_yaml::Value::String(prefix.to_string())),
             }),
             ConditionNode::Leaf(Condition {
+                compiled_regex: None,
                 field: "method".to_string(),
                 operator: "not_equals".to_string(),
                 value: Some(serde_yaml::Value::String("GET".to_string())),
@@ -516,7 +594,13 @@ fn build_custom_rule(theme: &ColorfulTheme) -> Option<Rule> {
     let mut conditions: Vec<ConditionNode> = Vec::new();
     loop {
         println!("  --- Add Condition ---");
-        let fields = vec!["path", "method", "client_ip", "header.<name>", "body.<path>"];
+        let fields = vec![
+            "path",
+            "method",
+            "client_ip",
+            "header.<name>",
+            "body.<path>",
+        ];
         let field_idx = Select::with_theme(theme)
             .with_prompt("Condition field")
             .items(&fields)
@@ -543,9 +627,18 @@ fn build_custom_rule(theme: &ColorfulTheme) -> Option<Rule> {
         }
 
         let operators = vec![
-            "equals", "not_equals", "contains", "not_contains",
-            "starts_with", "ends_with", "matches", "not_matches",
-            "in", "not_in", "exists", "not_exists",
+            "equals",
+            "not_equals",
+            "contains",
+            "not_contains",
+            "starts_with",
+            "ends_with",
+            "matches",
+            "not_matches",
+            "in",
+            "not_in",
+            "exists",
+            "not_exists",
         ];
         let op_idx = Select::with_theme(theme)
             .with_prompt("Operator")
@@ -573,6 +666,7 @@ fn build_custom_rule(theme: &ColorfulTheme) -> Option<Rule> {
         };
 
         conditions.push(ConditionNode::Leaf(Condition {
+            compiled_regex: None,
             field: field.clone(),
             operator: operator.clone(),
             value: value.clone(),
@@ -618,7 +712,11 @@ fn build_custom_rule(theme: &ColorfulTheme) -> Option<Rule> {
                     .default("Config.Env".to_string())
                     .interact_text()
                     .unwrap();
-                let filter_actions = vec!["redact -- replace with ***REDACTED***", "remove -- delete the field", "replace -- set to custom value"];
+                let filter_actions = vec![
+                    "redact -- replace with ***REDACTED***",
+                    "remove -- delete the field",
+                    "replace -- set to custom value",
+                ];
                 let fa_idx = Select::with_theme(theme)
                     .with_prompt("Filter action")
                     .items(&filter_actions)
@@ -632,11 +730,13 @@ fn build_custom_rule(theme: &ColorfulTheme) -> Option<Rule> {
                     _ => "redact",
                 };
                 let replacement = if fa == "replace" {
-                    Some(Input::<String>::with_theme(theme)
-                        .with_prompt("Replacement value")
-                        .default("".to_string())
-                        .interact_text()
-                        .unwrap())
+                    Some(
+                        Input::<String>::with_theme(theme)
+                            .with_prompt("Replacement value")
+                            .default("".to_string())
+                            .interact_text()
+                            .unwrap(),
+                    )
                 } else {
                     None
                 };

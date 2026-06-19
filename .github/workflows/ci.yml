@@ -1,0 +1,135 @@
+name: ci
+
+on:
+  push:
+    branches: [main, canary]
+  pull_request:
+    branches: [main, canary]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: format_check
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: unit_tests
+        run: cargo test --all
+      - name: script_syntax
+        run: bash -n setup uninstall build update
+
+  api_e2e:
+    runs-on: ubuntu-latest
+    env:
+      ADMIN_TOKEN: admin_test_token
+      READONLY_TOKEN: readonly_test_token
+      DOCKER_SOCKET: /var/run/docker.sock
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build_binary
+        run: cargo build --release --bin docker-proxy
+      - name: write_ci_config
+        run: |
+          cat > ci-config.yaml <<'YAML'
+          global:
+            port: 2376
+            bind: 127.0.0.1
+            metrics:
+              enabled: true
+              path: /metrics
+          auth:
+            type: bearer
+            tokens:
+              - token: "${ADMIN_TOKEN}"
+                role: admin
+              - token: "${READONLY_TOKEN}"
+                role: readonly
+          rules:
+            - name: block_secrets
+              conditions:
+                - field: path
+                  operator: starts_with
+                  value: /secrets
+              action: deny
+              status: 403
+              message: secrets blocked
+          YAML
+      - name: start_proxy
+        run: |
+          ./target/release/docker-proxy --config ci-config.yaml &
+          echo "proxy_pid=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 40); do
+            c=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:2376/version || true)
+            if [ -n "$c" ] && [ "$c" != "000" ]; then break; fi
+            sleep 0.5
+          done
+      - name: assert_api
+        run: |
+          fail() { echo "::error::$1"; kill "$proxy_pid" 2>/dev/null; exit 1; }
+          code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+
+          c=$(code http://127.0.0.1:2376/version)
+          [ "$c" = "401" ] || fail "no_token expected 401 got $c"
+
+          c=$(code -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:2376/version)
+          [ "$c" = "200" ] || fail "admin /version expected 200 got $c"
+
+          c=$(code -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:2376/secrets)
+          [ "$c" = "403" ] || fail "deny rule expected 403 got $c"
+
+          c=$(code -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:2376/metrics)
+          [ "$c" = "200" ] || fail "metrics expected 200 got $c"
+      - name: stop_proxy
+        if: always()
+        run: kill "$proxy_pid" 2>/dev/null || true
+
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            zig: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            zig: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            zig: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: install_zigbuild
+        if: matrix.zig
+        run: |
+          curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ
+          echo "$PWD/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+          cargo install cargo-zigbuild
+      - name: build_zig
+        if: matrix.zig
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+      - name: build_native
+        if: ${{ !matrix.zig }}
+        run: cargo build --release --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-proxy-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/docker-proxy

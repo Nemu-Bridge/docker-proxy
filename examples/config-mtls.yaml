@@ -82,6 +82,21 @@ rules:
     action: deny
     message: "Adding privileged Linux capabilities is not allowed"
 
+  - name: "block-bind-mounts"
+    priority: 500
+    conditions:
+      - field: path
+        operator: equals
+        value: /containers/create
+      - or:
+          - field: body.HostConfig.Binds
+            operator: exists
+          - field: body.HostConfig.Mounts
+            operator: matches
+            value: '"Type"\s*:\s*"bind"'
+    action: deny
+    message: "Bind mounts are not allowed"
+
   - name: "admin-mutations"
     conditions:
       - field: method

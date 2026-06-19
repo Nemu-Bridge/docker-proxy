@@ -4,6 +4,8 @@
 # rustls; clients must speak HTTPS. Tokens still flow at the application
 # layer.
 #
+# Set ADMIN_TOKEN and READONLY_TOKEN in the environment before starting.
+#
 # Generate a self-signed cert for local testing with:
 #   openssl req -x509 -newkey rsa:4096 -nodes -days 365 \
 #     -keyout /etc/docker-proxy/server.key \
@@ -66,6 +68,33 @@ rules:
             value: "^/exec/[^/]+/start$"
     action: deny
     message: "Exec operations are not permitted"
+
+  - name: "block-bind-mounts"
+    priority: 500
+    conditions:
+      - field: path
+        operator: equals
+        value: "/containers/create"
+      - or:
+          - field: body.HostConfig.Binds
+            operator: exists
+          - field: body.HostConfig.Mounts
+            operator: matches
+            value: '"Type"\s*:\s*"bind"'
+    action: deny
+    message: "Bind mounts are not allowed"
+
+  - name: "block-privileged"
+    priority: 500
+    conditions:
+      - field: path
+        operator: equals
+        value: "/containers/create"
+      - field: body.HostConfig.Privileged
+        operator: equals
+        value: true
+    action: deny
+    message: "Privileged containers are not allowed"
 
   - name: "admin-only-mutations"
     conditions:

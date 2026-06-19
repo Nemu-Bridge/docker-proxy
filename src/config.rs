@@ -1,7 +1,8 @@
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use secrecy::{ExposeSecret, SecretString};
+use serde::{de::Visitor, Deserialize, Deserializer, Serialize, Serializer};
 use std::{env, fs, path::PathBuf};
-use tracing::{info, warn};
+use tracing::info;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GlobalConfig {
@@ -21,6 +22,8 @@ pub struct GlobalConfig {
     pub tls: Option<TlsConfig>,
     #[serde(default)]
     pub metrics: Option<MetricsConfig>,
+    #[serde(default)]
+    pub trusted_proxies: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,9 +58,48 @@ pub struct MtlsConfig {
     pub default_role: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SecretToken(SecretString);
+
+impl SecretToken {
+    pub fn new(s: String) -> Self {
+        Self(SecretString::new(s.into_boxed_str()))
+    }
+
+    pub fn expose_secret(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretToken {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct SecretTokenVisitor;
+
+        impl<'de> Visitor<'de> for SecretTokenVisitor {
+            type Value = SecretToken;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(SecretToken::new(v.to_string()))
+            }
+        }
+
+        deserializer.deserialize_str(SecretTokenVisitor)
+    }
+}
+
+impl Serialize for SecretToken {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.expose_secret())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenEntry {
-    pub token: String,
+    pub token: SecretToken,
     #[serde(default)]
     pub role: Option<String>,
 }
@@ -67,32 +109,30 @@ pub struct AuthConfig {
     #[serde(default, rename = "type")]
     pub auth_type: Option<String>,
     #[serde(default)]
-    pub secret: Option<String>,
+    pub secret: Option<SecretToken>,
     #[serde(default)]
     pub tokens: Option<Vec<TokenEntry>>,
     #[serde(default)]
     pub mtls: Option<MtlsConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Condition {
     pub field: String,
     #[serde(default)]
     pub operator: String,
     #[serde(default)]
     pub value: Option<serde_yaml::Value>,
+    #[serde(skip)]
+    pub compiled_regex: Option<Regex>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ConditionNode {
     Leaf(Condition),
-    And {
-        and: Vec<ConditionNode>,
-    },
-    Or {
-        or: Vec<ConditionNode>,
-    },
+    And { and: Vec<ConditionNode> },
+    Or { or: Vec<ConditionNode> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +165,7 @@ pub struct RateLimitConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
+#[derive(Default)]
 pub struct Rule {
     pub name: String,
     #[serde(default)]
@@ -151,26 +192,7 @@ pub struct Rule {
     pub dry_run: Option<bool>,
 }
 
-impl Default for Rule {
-    fn default() -> Self {
-        Rule {
-            name: String::new(),
-            description: None,
-            action: String::new(),
-            priority: None,
-            conditions: Vec::new(),
-            message: None,
-            role: None,
-            response_filter: None,
-            status: None,
-            methods: None,
-            rate_limit: None,
-            dry_run: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProxyConfig {
     #[serde(default)]
     pub global: Option<GlobalConfig>,
@@ -180,77 +202,193 @@ pub struct ProxyConfig {
     pub rules: Option<Vec<Rule>>,
 }
 
-#[allow(dead_code)]
-fn expand_env(s: &str) -> String {
+fn expand_env(s: &str, required: bool) -> Result<String, String> {
     let re = Regex::new(r"\$\{(?<name>\w+)\}").expect("invalid env var regex");
-    re.replace_all(s, |caps: &regex::Captures| {
-        env::var(&caps["name"]).unwrap_or_default()
-    })
-    .to_string()
+    let mut missing: Vec<String> = Vec::new();
+    let result = re
+        .replace_all(s, |caps: &regex::Captures| match env::var(&caps["name"]) {
+            Ok(v) => v,
+            Err(_) => {
+                missing.push(caps["name"].to_string());
+                String::new()
+            }
+        })
+        .to_string();
+    if required && !missing.is_empty() {
+        return Err(format!(
+            "required environment variables missing: {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(result)
 }
 
-#[allow(dead_code)]
-fn expand_value_env(value: &mut serde_yaml::Value) {
+fn expand_value_env(value: &mut serde_yaml::Value, required: bool) -> Result<(), String> {
     match value {
-        serde_yaml::Value::String(s) => *s = expand_env(s),
+        serde_yaml::Value::String(s) => *s = expand_env(s, required)?,
         serde_yaml::Value::Sequence(seq) => {
             for v in seq.iter_mut() {
-                expand_value_env(v);
+                expand_value_env(v, required)?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
-#[allow(dead_code)]
-fn expand_node_env(node: &mut ConditionNode) {
+fn expand_node_env(node: &mut ConditionNode, required: bool) -> Result<(), String> {
     match node {
         ConditionNode::Leaf(condition) => {
             if let Some(ref mut value) = condition.value {
-                expand_value_env(value);
+                expand_value_env(value, required)?;
             }
         }
         ConditionNode::And { and } => {
             for n in and.iter_mut() {
-                expand_node_env(n);
+                expand_node_env(n, required)?;
             }
         }
         ConditionNode::Or { or } => {
             for n in or.iter_mut() {
-                expand_node_env(n);
+                expand_node_env(n, required)?;
             }
         }
     }
+    Ok(())
 }
 
-#[allow(dead_code)]
+fn compile_regex_in_condition(condition: &mut Condition) -> Result<(), String> {
+    if matches!(condition.operator.as_str(), "matches" | "not_matches") {
+        if let Some(ref value) = condition.value {
+            if let Some(s) = yaml_value_to_string(value) {
+                let regex = Regex::new(&s)
+                    .map_err(|e| format!("invalid regex for field '{}': {e}", condition.field))?;
+                condition.compiled_regex = Some(regex);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn compile_regexes_in_node(node: &mut ConditionNode) -> Result<(), String> {
+    match node {
+        ConditionNode::Leaf(condition) => compile_regex_in_condition(condition),
+        ConditionNode::And { and } => and.iter_mut().try_for_each(compile_regexes_in_node),
+        ConditionNode::Or { or } => or.iter_mut().try_for_each(compile_regexes_in_node),
+    }
+}
+
+pub fn yaml_value_to_string(value: &serde_yaml::Value) -> Option<String> {
+    match value {
+        serde_yaml::Value::String(s) => Some(s.clone()),
+        serde_yaml::Value::Bool(b) => Some(b.to_string()),
+        serde_yaml::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
 impl ProxyConfig {
-    fn resolve_env_vars(&mut self) {
+    fn resolve_env_vars(&mut self) -> Result<(), String> {
         if let Some(ref mut auth) = self.auth {
             if let Some(ref mut secret) = auth.secret {
-                *secret = expand_env(secret);
+                let expanded = expand_env(secret.expose_secret(), true)?;
+                *secret = SecretToken::new(expanded);
             }
             if let Some(ref mut tokens) = auth.tokens {
                 for t in tokens.iter_mut() {
-                    t.token = expand_env(&t.token);
+                    let expanded = expand_env(t.token.expose_secret(), true)?;
+                    t.token = SecretToken::new(expanded);
                 }
             }
         }
         if let Some(ref mut rules) = self.rules {
             for rule in rules.iter_mut() {
                 if let Some(ref mut msg) = rule.message {
-                    *msg = expand_env(msg);
+                    *msg = expand_env(msg, false)?;
                 }
                 for node in rule.conditions.iter_mut() {
-                    expand_node_env(node);
+                    expand_node_env(node, false)?;
                 }
                 if let Some(ref mut methods) = rule.methods {
                     for m in methods.iter_mut() {
-                        *m = expand_env(m);
+                        *m = expand_env(m, false)?;
                     }
                 }
             }
         }
+        Ok(())
+    }
+
+    fn compile_regexes(&mut self) -> Result<(), String> {
+        if let Some(ref mut rules) = self.rules {
+            for rule in rules.iter_mut() {
+                for node in rule.conditions.iter_mut() {
+                    compile_regexes_in_node(node)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if let Some(ref auth) = self.auth {
+            if let Some(ref t) = auth.auth_type {
+                match t.as_str() {
+                    "none" | "bearer" | "mtls" => {}
+                    other => return Err(format!("invalid auth.type: {other}")),
+                }
+            }
+        }
+
+        if let Some(ref rules) = self.rules {
+            for rule in rules {
+                if rule.name.is_empty() {
+                    return Err("rule name cannot be empty".into());
+                }
+                if rule.action.is_empty() {
+                    return Err(format!("rule '{}' has no action", rule.name));
+                }
+                if rule.conditions.is_empty() {
+                    return Err(format!("rule '{}' has no conditions", rule.name));
+                }
+                if rule.action == "require_role" && rule.role.is_none() {
+                    return Err(format!(
+                        "rule '{}' uses require_role but has no role specified",
+                        rule.name
+                    ));
+                }
+                if rule.action == "rate_limit" && rule.rate_limit.is_none() {
+                    return Err(format!(
+                        "rule '{}' uses rate_limit but has no rate_limit config",
+                        rule.name
+                    ));
+                }
+                if rule.action == "response_filter" && rule.response_filter.is_none() {
+                    return Err(format!(
+                        "rule '{}' uses response_filter but has no response_filter entries",
+                        rule.name
+                    ));
+                }
+            }
+        }
+
+        if let Some(ref global) = self.global {
+            if let Some(ref metrics) = global.metrics {
+                if metrics.enabled == Some(true) {
+                    let path = metrics.path.as_deref().unwrap_or("/metrics");
+                    if path == "/" || path.is_empty() {
+                        return Err("metrics path cannot be '/' or empty".into());
+                    }
+                    if path.starts_with("/v") {
+                        return Err(format!(
+                            "metrics path '{path}' looks like a Docker API versioned path"
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn apply_env_overrides(&mut self) {
@@ -277,7 +415,10 @@ impl ProxyConfig {
                     tokens: None,
                     mtls: None,
                 });
-                auth.secret = Some(secret);
+                auth.secret = Some(SecretToken::new(secret));
+                if auth.auth_type.is_none() {
+                    auth.auth_type = Some("bearer".to_string());
+                }
             }
         }
     }
@@ -289,20 +430,21 @@ impl ProxyConfig {
                 a.auth_type.as_deref() == Some("none")
                     || a.auth_type.as_deref() == Some("mtls")
                     || a.tokens.as_ref().map(|t| !t.is_empty()).unwrap_or(false)
-                    || a.secret.as_ref().map(|s| !s.is_empty()).unwrap_or(false)
+                    || a.secret
+                        .as_ref()
+                        .map(|s| !s.expose_secret().is_empty())
+                        .unwrap_or(false)
             }
         }
     }
 
     pub fn sort_rules_by_priority(&mut self) {
         if let Some(ref mut rules) = self.rules {
-            rules.sort_by(|a, b| {
-                b.priority.unwrap_or(0).cmp(&a.priority.unwrap_or(0))
-            });
+            rules.sort_by_key(|r| std::cmp::Reverse(r.priority.unwrap_or(0)));
         }
     }
 
-    pub fn load() -> Self {
+    pub fn load() -> Result<Self, String> {
         let config_path = env::var("DOCKER_PROXY_CONFIG")
             .ok()
             .map(PathBuf::from)
@@ -318,19 +460,10 @@ impl ProxyConfig {
         let mut config = match config_path {
             Some(ref path) if path.exists() => {
                 info!("loading config from {}", path.display());
-                match fs::read_to_string(path) {
-                    Ok(content) => match serde_yaml::from_str::<ProxyConfig>(&content) {
-                        Ok(cfg) => cfg,
-                        Err(e) => {
-                            warn!("failed to parse config, using defaults: {e}");
-                            ProxyConfig::default()
-                        }
-                    },
-                    Err(e) => {
-                        warn!("failed to read config file, using defaults: {e}");
-                        ProxyConfig::default()
-                    }
-                }
+                let content = fs::read_to_string(path)
+                    .map_err(|e| format!("failed to read config file: {e}"))?;
+                serde_yaml::from_str::<ProxyConfig>(&content)
+                    .map_err(|e| format!("failed to parse config: {e}"))?
             }
             _ => {
                 info!("no config file found, using defaults");
@@ -338,30 +471,24 @@ impl ProxyConfig {
             }
         };
 
-        config.resolve_env_vars();
+        config.resolve_env_vars()?;
         config.apply_env_overrides();
+        config.compile_regexes()?;
+        config.validate()?;
         config.sort_rules_by_priority();
-        config
+        Ok(config)
     }
 
     pub fn load_from_path(path: &std::path::Path) -> Result<Self, String> {
         let content = fs::read_to_string(path).map_err(|e| format!("read failed: {e}"))?;
-        let mut cfg: ProxyConfig = serde_yaml::from_str(&content)
-            .map_err(|e| format!("parse failed: {e}"))?;
-        cfg.resolve_env_vars();
+        let mut cfg: ProxyConfig =
+            serde_yaml::from_str(&content).map_err(|e| format!("parse failed: {e}"))?;
+        cfg.resolve_env_vars()?;
         cfg.apply_env_overrides();
+        cfg.compile_regexes()?;
+        cfg.validate()?;
         cfg.sort_rules_by_priority();
         Ok(cfg)
-    }
-}
-
-impl Default for ProxyConfig {
-    fn default() -> Self {
-        ProxyConfig {
-            global: None,
-            auth: None,
-            rules: None,
-        }
     }
 }
 
@@ -389,7 +516,10 @@ rules:
 "#;
         let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.global.as_ref().unwrap().port, Some(1234));
-        assert_eq!(cfg.auth.as_ref().unwrap().auth_type.as_deref(), Some("bearer"));
+        assert_eq!(
+            cfg.auth.as_ref().unwrap().auth_type.as_deref(),
+            Some("bearer")
+        );
         assert_eq!(cfg.rules.as_ref().unwrap().len(), 1);
         assert_eq!(cfg.rules.as_ref().unwrap()[0].name, "test-rule");
     }
@@ -458,15 +588,21 @@ rules:
     #[test]
     fn test_env_expansion() {
         std::env::set_var("TEST_VAR", "expanded_value");
-        let result = expand_env("prefix_${TEST_VAR}_suffix");
+        let result = expand_env("prefix_${TEST_VAR}_suffix", false).unwrap();
         assert_eq!(result, "prefix_expanded_value_suffix");
         std::env::remove_var("TEST_VAR");
     }
 
     #[test]
-    fn test_env_expansion_unset() {
-        let result = expand_env("${NONEXISTENT_VAR_12345}");
+    fn test_env_expansion_unset_not_required() {
+        let result = expand_env("${NONEXISTENT_VAR_12345}", false).unwrap();
         assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_env_expansion_unset_required_errors() {
+        let result = expand_env("${NONEXISTENT_VAR_12345}", true);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -559,7 +695,10 @@ rules:
             auth: Some(AuthConfig {
                 auth_type: Some("bearer".into()),
                 secret: None,
-                tokens: Some(vec![TokenEntry { token: "t".into(), role: Some("admin".into()) }]),
+                tokens: Some(vec![TokenEntry {
+                    token: SecretToken::new("t".into()),
+                    role: Some("admin".into()),
+                }]),
                 mtls: None,
             }),
             ..Default::default()
@@ -572,7 +711,7 @@ rules:
         let cfg = ProxyConfig {
             auth: Some(AuthConfig {
                 auth_type: Some("bearer".into()),
-                secret: Some("s".into()),
+                secret: Some(SecretToken::new("s".into())),
                 tokens: None,
                 mtls: None,
             }),
@@ -649,7 +788,13 @@ rules:
 "#;
         let mut cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
         cfg.sort_rules_by_priority();
-        let names: Vec<&str> = cfg.rules.as_ref().unwrap().iter().map(|r| r.name.as_str()).collect();
+        let names: Vec<&str> = cfg
+            .rules
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
         assert_eq!(names, vec!["b", "c", "d", "a"]);
     }
 
@@ -725,5 +870,50 @@ rules:
 "#;
         let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.rules.unwrap()[0].conditions.len(), 2);
+    }
+
+    #[test]
+    fn test_validation_rejects_empty_action() {
+        let yaml = r#"
+rules:
+  - name: r
+    conditions:
+      - field: path
+        operator: equals
+        value: /x
+"#;
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validation_rejects_missing_require_role() {
+        let yaml = r#"
+rules:
+  - name: r
+    action: require_role
+    conditions:
+      - field: path
+        operator: equals
+        value: /x
+"#;
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validation_accepts_valid_require_role() {
+        let yaml = r#"
+rules:
+  - name: r
+    action: require_role
+    role: admin
+    conditions:
+      - field: path
+        operator: equals
+        value: /x
+"#;
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_ok());
     }
 }

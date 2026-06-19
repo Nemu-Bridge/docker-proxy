@@ -1,5 +1,9 @@
 # Docker Proxy Configuration
 # ===========================
+#
+# WARNING: Replace the placeholder token environment variables with real values
+# before deploying. The proxy will refuse to start if ADMIN_TOKEN or READONLY_TOKEN
+# is unset.
 
 global:
   port: 2376
@@ -11,9 +15,9 @@ global:
 auth:
   type: bearer
   tokens:
-    - token: "admin-token-abc123"
+    - token: "${ADMIN_TOKEN}"
       role: admin
-    - token: "readonly-token-xyz789"
+    - token: "${READONLY_TOKEN}"
       role: readonly
 
 # Access Rules (evaluated in order, first match wins)
@@ -77,8 +81,8 @@ rules:
         operator: starts_with
         value: "/images"
       - field: method
-        operator: in
-        value: ["PUT", "POST", "DELETE"]
+        operator: not_equals
+        value: GET
     action: deny
     message: "Image mutations are forbidden"
 
@@ -132,8 +136,12 @@ rules:
       - field: path
         operator: equals
         value: "/containers/create"
-      - field: body.HostConfig.Binds
-        operator: exists
+      - or:
+          - field: body.HostConfig.Binds
+            operator: exists
+          - field: body.HostConfig.Mounts
+            operator: matches
+            value: '"Type"\s*:\s*"bind"'
     action: deny
     message: "Bind mounts are not allowed"
 

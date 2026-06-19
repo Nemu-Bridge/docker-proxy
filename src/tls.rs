@@ -23,7 +23,10 @@ pub fn build_server_config(tls: &TlsConfig) -> Result<Arc<ServerConfig>, String>
     let key = load_private_key(Path::new(&tls.key))?;
 
     let builder = ServerConfig::builder();
-    let server_config = match (tls.client_ca.as_deref(), tls.require_client_cert.unwrap_or(false)) {
+    let server_config = match (
+        tls.client_ca.as_deref(),
+        tls.require_client_cert.unwrap_or(false),
+    ) {
         (Some(ca_path), require) => {
             let mut roots = RootCertStore::empty();
             for cert in load_certs(Path::new(ca_path))? {
@@ -121,12 +124,6 @@ pub fn resolve_mtls_role(identity: &CertIdentity, mtls: Option<&MtlsConfig>) -> 
         }
     }
 
-    if let Some(cn) = identity.common_name.clone() {
-        if !cn.is_empty() {
-            return Some(cn);
-        }
-    }
-
     mtls.and_then(|m| m.default_role.clone())
 }
 
@@ -155,7 +152,10 @@ mod tests {
 
     #[test]
     fn test_cn_match_wildcard() {
-        assert!(cn_match("*.readonly.example.com", "host1.readonly.example.com"));
+        assert!(cn_match(
+            "*.readonly.example.com",
+            "host1.readonly.example.com"
+        ));
         assert!(!cn_match("*.readonly.example.com", "readonly.example.com"));
         assert!(!cn_match("*.readonly.example.com", "host1.example.com"));
     }
@@ -173,11 +173,14 @@ mod tests {
             }]),
             default_role: None,
         };
-        assert_eq!(resolve_mtls_role(&id, Some(&mtls)).as_deref(), Some("admin"));
+        assert_eq!(
+            resolve_mtls_role(&id, Some(&mtls)).as_deref(),
+            Some("admin")
+        );
     }
 
     #[test]
-    fn test_resolve_role_falls_back_to_cn() {
+    fn test_resolve_role_does_not_fall_back_to_cn() {
         let id = CertIdentity {
             common_name: Some("dev.example.com".into()),
             sans: vec![],
@@ -189,10 +192,7 @@ mod tests {
             }]),
             default_role: None,
         };
-        assert_eq!(
-            resolve_mtls_role(&id, Some(&mtls)).as_deref(),
-            Some("dev.example.com")
-        );
+        assert_eq!(resolve_mtls_role(&id, Some(&mtls)).as_deref(), None);
     }
 
     #[test]
@@ -208,12 +208,18 @@ mod tests {
             }]),
             default_role: Some("user".into()),
         };
-        assert_eq!(resolve_mtls_role(&id, Some(&mtls)).as_deref(), Some("readonly"));
+        assert_eq!(
+            resolve_mtls_role(&id, Some(&mtls)).as_deref(),
+            Some("readonly")
+        );
 
         let id_empty = CertIdentity {
             common_name: None,
             sans: vec![],
         };
-        assert_eq!(resolve_mtls_role(&id_empty, Some(&mtls)).as_deref(), Some("user"));
+        assert_eq!(
+            resolve_mtls_role(&id_empty, Some(&mtls)).as_deref(),
+            Some("user")
+        );
     }
 }

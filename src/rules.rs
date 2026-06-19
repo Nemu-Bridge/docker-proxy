@@ -1,5 +1,4 @@
 use crate::config::{Condition, ConditionNode, ResponseFilterEntry, Rule};
-use regex::Regex;
 use serde_json::Value as JsonValue;
 use std::{
     collections::HashMap,
@@ -16,10 +15,7 @@ const MAX_AUTH_LIMITER_KEYS: usize = 16384;
 #[derive(Debug, Clone)]
 pub enum RuleResult {
     Allow,
-    Deny {
-        status: u16,
-        message: String,
-    },
+    Deny { status: u16, message: String },
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +57,12 @@ struct RateBucket {
     blocked_until: Option<Instant>,
 }
 
+impl Default for RateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RateLimiter {
     pub fn new() -> Self {
         RateLimiter {
@@ -84,12 +86,14 @@ impl RateLimiter {
         if !buckets.contains_key(key) && buckets.len() >= MAX_RATE_LIMIT_BUCKETS {
             return false;
         }
-        let bucket = buckets.entry(key.to_string()).or_insert_with(|| RateBucket {
-            last_check: now,
-            tokens: max_tokens,
-            max_tokens,
-            blocked_until: None,
-        });
+        let bucket = buckets
+            .entry(key.to_string())
+            .or_insert_with(|| RateBucket {
+                last_check: now,
+                tokens: max_tokens,
+                max_tokens,
+                blocked_until: None,
+            });
 
         if let Some(blocked) = bucket.blocked_until {
             if now < blocked {
@@ -137,6 +141,12 @@ struct AuthLockoutState {
     blocked_until: Option<Instant>,
 }
 
+impl Default for AuthLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AuthLimiter {
     pub fn new() -> Self {
         AuthLimiter {
@@ -147,16 +157,16 @@ impl AuthLimiter {
     pub fn is_blocked(&self, key: &str) -> bool {
         let g = self.state.lock().unwrap_or_else(|p| p.into_inner());
         match g.get(key) {
-            Some(s) => s.blocked_until.map_or(false, |u| Instant::now() < u),
+            Some(s) => s.blocked_until.is_some_and(|u| Instant::now() < u),
             None => false,
         }
     }
 
-    pub fn record_failure(&self, key: &str, max: u32, window: Duration, lockout: Duration) {
+    pub fn record_failure(&self, key: &str, max: u32, window: Duration, lockout: Duration) -> bool {
         let mut g = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
         if g.len() >= MAX_AUTH_LIMITER_KEYS && !g.contains_key(key) {
-            return;
+            return false;
         }
         let entry = g.entry(key.to_string()).or_insert(AuthLockoutState {
             failures: 0,
@@ -175,8 +185,12 @@ impl AuthLimiter {
             entry.first_failure = now;
         }
         entry.failures = entry.failures.saturating_add(1);
-        if entry.failures >= max {
+
+        if entry.failures >= max && entry.blocked_until.is_none() {
             entry.blocked_until = Some(now + lockout);
+            true
+        } else {
+            false
         }
     }
 
@@ -250,10 +264,8 @@ fn json_remove(root: &mut JsonValue, path: &str) -> bool {
     }
     let parent_path = segments[..segments.len() - 1].join(".");
     let key = segments.last().unwrap();
-    if let Some(parent) = json_get_mut(root, &parent_path) {
-        if let JsonValue::Object(ref mut map) = parent {
-            return map.remove(*key).is_some();
-        }
+    if let Some(JsonValue::Object(ref mut map)) = json_get_mut(root, &parent_path) {
+        return map.remove(*key).is_some();
     }
     false
 }
@@ -274,28 +286,32 @@ fn match_path_condition(condition: &Condition, path: &str) -> bool {
     };
 
     match condition.operator.as_str() {
-        "equals" => val.map_or(false, |v| path == v),
-        "not_equals" => val.map_or(true, |v| path != v),
-        "contains" => val.map_or(false, |v| path.contains(&v)),
-        "not_contains" => val.map_or(true, |v| !path.contains(&v)),
-        "starts_with" => val.map_or(false, |v| path.starts_with(&v)),
-        "ends_with" => val.map_or(false, |v| path.ends_with(&v)),
-        "matches" => val.map_or(false, |v| {
-            Regex::new(&v).map(|r| r.is_match(path)).unwrap_or(false)
-        }),
-        "not_matches" => val.map_or(true, |v| {
-            Regex::new(&v).map(|r| !r.is_match(path)).unwrap_or(true)
-        }),
+        "equals" => val.is_some_and(|v| path == v),
+        "not_equals" => val.is_none_or(|v| path != v),
+        "contains" => val.is_some_and(|v| path.contains(&v)),
+        "not_contains" => val.is_none_or(|v| !path.contains(&v)),
+        "starts_with" => val.is_some_and(|v| path.starts_with(&v)),
+        "ends_with" => val.is_some_and(|v| path.ends_with(&v)),
+        "matches" => condition
+            .compiled_regex
+            .as_ref()
+            .map(|r| r.is_match(path))
+            .unwrap_or(false),
+        "not_matches" => condition
+            .compiled_regex
+            .as_ref()
+            .map(|r| !r.is_match(path))
+            .unwrap_or(true),
         "in" => match &condition.value {
-            Some(serde_yaml::Value::Sequence(seq)) => seq.iter().any(|v| {
-                yaml_value_to_string(v).map_or(false, |s| s == path)
-            }),
+            Some(serde_yaml::Value::Sequence(seq)) => seq
+                .iter()
+                .any(|v| yaml_value_to_string(v).is_some_and(|s| s == path)),
             _ => false,
         },
         "not_in" => match &condition.value {
-            Some(serde_yaml::Value::Sequence(seq)) => seq.iter().all(|v| {
-                yaml_value_to_string(v).map_or(true, |s| s != path)
-            }),
+            Some(serde_yaml::Value::Sequence(seq)) => seq
+                .iter()
+                .all(|v| yaml_value_to_string(v).is_none_or(|s| s != path)),
             _ => true,
         },
         _ => false,
@@ -309,25 +325,29 @@ fn match_method_condition(condition: &Condition, method: &str) -> bool {
     };
 
     match condition.operator.as_str() {
-        "equals" => val.map_or(false, |v| method.eq_ignore_ascii_case(&v)),
-        "not_equals" => val.map_or(true, |v| !method.eq_ignore_ascii_case(&v)),
+        "equals" => val.is_some_and(|v| method.eq_ignore_ascii_case(&v)),
+        "not_equals" => val.is_none_or(|v| !method.eq_ignore_ascii_case(&v)),
         "in" => match &condition.value {
-            Some(serde_yaml::Value::Sequence(seq)) => seq.iter().any(|v| {
-                yaml_value_to_string(v).map_or(false, |s| method.eq_ignore_ascii_case(&s))
-            }),
+            Some(serde_yaml::Value::Sequence(seq)) => seq
+                .iter()
+                .any(|v| yaml_value_to_string(v).is_some_and(|s| method.eq_ignore_ascii_case(&s))),
             _ => false,
         },
         "not_in" => match &condition.value {
-            Some(serde_yaml::Value::Sequence(seq)) => seq.iter().all(|v| {
-                yaml_value_to_string(v).map_or(true, |s| !method.eq_ignore_ascii_case(&s))
-            }),
+            Some(serde_yaml::Value::Sequence(seq)) => seq
+                .iter()
+                .all(|v| yaml_value_to_string(v).is_none_or(|s| !method.eq_ignore_ascii_case(&s))),
             _ => true,
         },
         _ => false,
     }
 }
 
-fn match_header_condition(condition: &Condition, headers: &HashMap<String, String>, header_name: &str) -> bool {
+fn match_header_condition(
+    condition: &Condition,
+    headers: &HashMap<String, String>,
+    header_name: &str,
+) -> bool {
     let header_val = headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(header_name))
@@ -335,27 +355,33 @@ fn match_header_condition(condition: &Condition, headers: &HashMap<String, Strin
     let cond_val = condition.value.as_ref().and_then(yaml_value_to_string);
 
     match condition.operator.as_str() {
-        "equals" => header_val.map_or(false, |v| cond_val.as_deref() == Some(v)),
-        "not_equals" => header_val.map_or(true, |v| cond_val.as_deref() != Some(v)),
-        "contains" => header_val.map_or(false, |v| cond_val.map_or(false, |cv| v.contains(&cv))),
-        "not_contains" => header_val.map_or(true, |v| cond_val.map_or(true, |cv| !v.contains(&cv))),
-        "starts_with" => header_val.map_or(false, |v| cond_val.map_or(false, |cv| v.starts_with(&cv))),
-        "ends_with" => header_val.map_or(false, |v| cond_val.map_or(false, |cv| v.ends_with(&cv))),
-        "matches" => header_val.map_or(false, |v| {
-            cond_val.and_then(|cv| Regex::new(&cv).ok().map(|r| r.is_match(v))).unwrap_or(false)
+        "equals" => header_val.is_some_and(|v| cond_val.as_deref() == Some(v)),
+        "not_equals" => header_val.is_none_or(|v| cond_val.as_deref() != Some(v)),
+        "contains" => header_val.is_some_and(|v| cond_val.is_some_and(|cv| v.contains(&cv))),
+        "not_contains" => header_val.is_none_or(|v| cond_val.is_none_or(|cv| !v.contains(&cv))),
+        "starts_with" => header_val.is_some_and(|v| cond_val.is_some_and(|cv| v.starts_with(&cv))),
+        "ends_with" => header_val.is_some_and(|v| cond_val.is_some_and(|cv| v.ends_with(&cv))),
+        "matches" => header_val.is_some_and(|v| {
+            condition
+                .compiled_regex
+                .as_ref()
+                .map(|r| r.is_match(v))
+                .unwrap_or(false)
         }),
         "exists" => header_val.is_some(),
         "not_exists" => header_val.is_none(),
         "in" => match &condition.value {
-            Some(serde_yaml::Value::Sequence(seq)) => {
-                header_val.map_or(false, |hv| seq.iter().any(|v| yaml_value_to_string(v).map_or(false, |s| s == hv)))
-            }
+            Some(serde_yaml::Value::Sequence(seq)) => header_val.is_some_and(|hv| {
+                seq.iter()
+                    .any(|v| yaml_value_to_string(v).is_some_and(|s| s == hv))
+            }),
             _ => false,
         },
         "not_in" => match &condition.value {
-            Some(serde_yaml::Value::Sequence(seq)) => {
-                header_val.map_or(true, |hv| seq.iter().all(|v| yaml_value_to_string(v).map_or(true, |s| s != hv)))
-            }
+            Some(serde_yaml::Value::Sequence(seq)) => header_val.is_none_or(|hv| {
+                seq.iter()
+                    .all(|v| yaml_value_to_string(v).is_none_or(|s| s != hv))
+            }),
             _ => true,
         },
         _ => false,
@@ -366,49 +392,61 @@ fn match_ip_condition(condition: &Condition, client_ip_str: &str) -> bool {
     let client_ip: Option<IpAddr> = client_ip_str.parse().ok();
 
     match condition.operator.as_str() {
-        "equals" => condition.value.as_ref().and_then(yaml_value_to_string).map_or(false, |v| {
-            client_ip.map_or(false, |ip| ip.to_string() == v)
-        }),
-        "not_equals" => condition.value.as_ref().and_then(yaml_value_to_string).map_or(true, |v| {
-            client_ip.map_or(true, |ip| ip.to_string() != v)
-        }),
+        "equals" => condition
+            .value
+            .as_ref()
+            .and_then(yaml_value_to_string)
+            .is_some_and(|v| client_ip.is_some_and(|ip| ip.to_string() == v)),
+        "not_equals" => condition
+            .value
+            .as_ref()
+            .and_then(yaml_value_to_string)
+            .is_none_or(|v| client_ip.is_none_or(|ip| ip.to_string() != v)),
         "in" => {
             let cidrs: Vec<String> = match &condition.value {
-                Some(serde_yaml::Value::Sequence(seq)) => seq
-                    .iter()
-                    .filter_map(|v| yaml_value_to_string(v))
-                    .collect(),
+                Some(serde_yaml::Value::Sequence(seq)) => {
+                    seq.iter().filter_map(yaml_value_to_string).collect()
+                }
                 Some(v) => yaml_value_to_string(v).into_iter().collect(),
                 None => vec![],
             };
-            let ipnets: Vec<IpNet> = cidrs.iter().filter_map(|c| c.parse::<IpNet>().ok()).collect();
+            let ipnets: Vec<IpNet> = cidrs
+                .iter()
+                .filter_map(|c| c.parse::<IpNet>().ok())
+                .collect();
             if ipnets.is_empty() {
-                client_ip.map_or(false, |ip| cidrs.iter().any(|s| s == &ip.to_string()))
+                client_ip.is_some_and(|ip| cidrs.iter().any(|s| s == &ip.to_string()))
             } else {
-                client_ip.map_or(false, |ip| ipnets.iter().any(|net| net.contains(&ip)))
+                client_ip.is_some_and(|ip| ipnets.iter().any(|net| net.contains(&ip)))
             }
         }
         "not_in" => {
             let cidrs: Vec<String> = match &condition.value {
-                Some(serde_yaml::Value::Sequence(seq)) => seq
-                    .iter()
-                    .filter_map(|v| yaml_value_to_string(v))
-                    .collect(),
+                Some(serde_yaml::Value::Sequence(seq)) => {
+                    seq.iter().filter_map(yaml_value_to_string).collect()
+                }
                 Some(v) => yaml_value_to_string(v).into_iter().collect(),
                 None => vec![],
             };
-            let ipnets: Vec<IpNet> = cidrs.iter().filter_map(|c| c.parse::<IpNet>().ok()).collect();
+            let ipnets: Vec<IpNet> = cidrs
+                .iter()
+                .filter_map(|c| c.parse::<IpNet>().ok())
+                .collect();
             if ipnets.is_empty() {
-                client_ip.map_or(true, |ip| cidrs.iter().all(|s| s != &ip.to_string()))
+                client_ip.is_none_or(|ip| cidrs.iter().all(|s| s != &ip.to_string()))
             } else {
-                client_ip.map_or(true, |ip| !ipnets.iter().any(|net| net.contains(&ip)))
+                client_ip.is_none_or(|ip| !ipnets.iter().any(|net| net.contains(&ip)))
             }
         }
         _ => false,
     }
 }
 
-fn match_body_condition(condition: &Condition, body_json: &Option<JsonValue>, field_path: &str) -> bool {
+fn match_body_condition(
+    condition: &Condition,
+    body_json: &Option<JsonValue>,
+    field_path: &str,
+) -> bool {
     let json_val = body_json.as_ref().and_then(|b| json_get(b, field_path));
 
     match condition.operator.as_str() {
@@ -421,48 +459,64 @@ fn match_body_condition(condition: &Condition, body_json: &Option<JsonValue>, fi
                 None => return false,
             };
             match condition.operator.as_str() {
-                "equals" => cond_val.map_or(false, |cv| value_equal(cv, json_val)),
-                "not_equals" => cond_val.map_or(true, |cv| !value_equal(cv, json_val)),
+                "equals" => cond_val.is_some_and(|cv| value_equal(cv, json_val)),
+                "not_equals" => cond_val.is_none_or(|cv| !value_equal(cv, json_val)),
                 "contains" => {
-                    let json_str = match json_val {
-                        JsonValue::String(s) => s.clone(),
-                        other => other.to_string(),
+                    let cond_str = match cond_val.and_then(yaml_value_to_string) {
+                        Some(s) => s,
+                        None => return false,
                     };
-                    cond_val
-                        .and_then(yaml_value_to_string)
-                        .map_or(false, |cv| json_str.contains(&cv))
+                    match json_val {
+                        JsonValue::String(s) => s.contains(&cond_str),
+                        JsonValue::Array(arr) => arr
+                            .iter()
+                            .any(|item| item.as_str().is_some_and(|s| s == cond_str)),
+                        other => other.to_string().contains(&cond_str),
+                    }
                 }
                 "not_contains" => {
-                    let json_str = match json_val {
-                        JsonValue::String(s) => s.clone(),
-                        other => other.to_string(),
+                    let cond_str = match cond_val.and_then(yaml_value_to_string) {
+                        Some(s) => s,
+                        None => return true,
                     };
-                    cond_val
-                        .and_then(yaml_value_to_string)
-                        .map_or(true, |cv| !json_str.contains(&cv))
+                    match json_val {
+                        JsonValue::String(s) => !s.contains(&cond_str),
+                        JsonValue::Array(arr) => arr
+                            .iter()
+                            .all(|item| item.as_str().is_none_or(|s| s != cond_str)),
+                        other => !other.to_string().contains(&cond_str),
+                    }
                 }
                 "in" => match cond_val {
-                    Some(serde_yaml::Value::Sequence(seq)) => seq.iter().any(|v| value_equal(v, json_val)),
+                    Some(serde_yaml::Value::Sequence(seq)) => {
+                        seq.iter().any(|v| value_equal(v, json_val))
+                    }
                     _ => false,
                 },
                 "not_in" => match cond_val {
-                    Some(serde_yaml::Value::Sequence(seq)) => seq.iter().all(|v| !value_equal(v, json_val)),
+                    Some(serde_yaml::Value::Sequence(seq)) => {
+                        seq.iter().all(|v| !value_equal(v, json_val))
+                    }
                     _ => true,
                 },
-                "starts_with" => cond_val.and_then(yaml_value_to_string).map_or(false, |cv| {
+                "starts_with" => cond_val.and_then(yaml_value_to_string).is_some_and(|cv| {
                     let s = match json_val {
                         JsonValue::String(s) => s.clone(),
                         other => other.to_string(),
                     };
                     s.starts_with(&cv)
                 }),
-                "matches" => cond_val.and_then(yaml_value_to_string).map_or(false, |cv| {
+                "matches" => {
                     let s = match json_val {
                         JsonValue::String(s) => s.clone(),
                         other => other.to_string(),
                     };
-                    Regex::new(&cv).map(|r| r.is_match(&s)).unwrap_or(false)
-                }),
+                    condition
+                        .compiled_regex
+                        .as_ref()
+                        .map(|r| r.is_match(&s))
+                        .unwrap_or(false)
+                }
                 _ => false,
             }
         }
@@ -484,12 +538,10 @@ fn value_equal(yaml_val: &serde_yaml::Value, json_val: &JsonValue) -> bool {
                 false
             }
         }
-        _ => {
-            match json_val {
-                JsonValue::Null => matches!(yaml_val, serde_yaml::Value::Null),
-                _ => false,
-            }
-        }
+        _ => match json_val {
+            JsonValue::Null => matches!(yaml_val, serde_yaml::Value::Null),
+            _ => false,
+        },
     }
 }
 
@@ -518,7 +570,11 @@ pub fn evaluate_node(node: &ConditionNode, ctx: &EvaluationContext) -> bool {
     }
 }
 
-pub fn evaluate_request(rules: &[Rule], ctx: &EvaluationContext, rate_limiter: &RateLimiter) -> RuleResult {
+pub fn evaluate_request(
+    rules: &[Rule],
+    ctx: &EvaluationContext,
+    rate_limiter: &RateLimiter,
+) -> RuleResult {
     evaluate_request_detailed(rules, ctx, rate_limiter).result
 }
 
@@ -598,9 +654,17 @@ pub fn evaluate_request_detailed(
                 continue;
             }
             "rate_limit" => {
+                if is_dry {
+                    continue;
+                }
                 if let Some(ref rl_config) = rule.rate_limit {
                     let key = format!("{}:{}", rule.name, ctx.client_ip);
-                    if !rate_limiter.check(&key, rl_config.requests, rl_config.period, rl_config.penalty) {
+                    if !rate_limiter.check(
+                        &key,
+                        rl_config.requests,
+                        rl_config.period,
+                        rl_config.penalty,
+                    ) {
                         let status = rule.status.unwrap_or(429);
                         let message = rule
                             .message
@@ -638,9 +702,7 @@ pub fn collect_response_filters(
 ) -> Vec<ResponseFilterEntry> {
     let mut all_filters = Vec::new();
     for rule in rules {
-        if rule.conditions.is_empty()
-            || !rule.conditions.iter().all(|c| evaluate_node(c, ctx))
-        {
+        if rule.conditions.is_empty() || !rule.conditions.iter().all(|c| evaluate_node(c, ctx)) {
             continue;
         }
         if let Some(ref filters) = rule.response_filter {
@@ -694,6 +756,7 @@ pub fn apply_response_filters(filters: &[ResponseFilterEntry], body: &[u8]) -> V
 mod tests {
     use super::*;
     use crate::config::{Condition, ConditionNode, RateLimitConfig, ResponseFilterEntry, Rule};
+    use regex::Regex;
     use serde_json::json;
     use std::collections::HashMap;
     use std::thread;
@@ -711,35 +774,81 @@ mod tests {
     }
 
     fn make_condition(field: &str, operator: &str, value: Option<serde_yaml::Value>) -> Condition {
-        Condition { field: field.to_string(), operator: operator.to_string(), value }
+        let mut condition = Condition {
+            compiled_regex: None,
+            field: field.to_string(),
+            operator: operator.to_string(),
+            value,
+        };
+        if matches!(condition.operator.as_str(), "matches" | "not_matches") {
+            if let Some(ref v) = condition.value {
+                if let Some(s) = yaml_value_to_string(v) {
+                    condition.compiled_regex = Regex::new(&s).ok();
+                }
+            }
+        }
+        condition
     }
 
     // --- Path conditions ---
 
     #[test]
     fn test_path_equals() {
-        let c = make_condition("path", "equals", Some(serde_yaml::Value::String("/test".into())));
-        assert!(evaluate_condition(&c, &make_ctx("/test", "GET", "127.0.0.1")));
-        assert!(!evaluate_condition(&c, &make_ctx("/other", "GET", "127.0.0.1")));
+        let c = make_condition(
+            "path",
+            "equals",
+            Some(serde_yaml::Value::String("/test".into())),
+        );
+        assert!(evaluate_condition(
+            &c,
+            &make_ctx("/test", "GET", "127.0.0.1")
+        ));
+        assert!(!evaluate_condition(
+            &c,
+            &make_ctx("/other", "GET", "127.0.0.1")
+        ));
     }
 
     #[test]
     fn test_path_starts_with() {
-        let c = make_condition("path", "starts_with", Some(serde_yaml::Value::String("/containers".into())));
-        assert!(evaluate_condition(&c, &make_ctx("/containers/json", "GET", "127.0.0.1")));
-        assert!(!evaluate_condition(&c, &make_ctx("/images/json", "GET", "127.0.0.1")));
+        let c = make_condition(
+            "path",
+            "starts_with",
+            Some(serde_yaml::Value::String("/containers".into())),
+        );
+        assert!(evaluate_condition(
+            &c,
+            &make_ctx("/containers/json", "GET", "127.0.0.1")
+        ));
+        assert!(!evaluate_condition(
+            &c,
+            &make_ctx("/images/json", "GET", "127.0.0.1")
+        ));
     }
 
     #[test]
     fn test_path_matches_regex() {
-        let c = make_condition("path", "matches", Some(serde_yaml::Value::String(r"^/containers/[^/]+/exec$".into())));
-        assert!(evaluate_condition(&c, &make_ctx("/containers/abc123/exec", "POST", "127.0.0.1")));
-        assert!(!evaluate_condition(&c, &make_ctx("/containers/abc123/start", "POST", "127.0.0.1")));
+        let c = make_condition(
+            "path",
+            "matches",
+            Some(serde_yaml::Value::String(
+                r"^/containers/[^/]+/exec$".into(),
+            )),
+        );
+        assert!(evaluate_condition(
+            &c,
+            &make_ctx("/containers/abc123/exec", "POST", "127.0.0.1")
+        ));
+        assert!(!evaluate_condition(
+            &c,
+            &make_ctx("/containers/abc123/start", "POST", "127.0.0.1")
+        ));
     }
 
     #[test]
     fn test_path_in() {
         let c = Condition {
+            compiled_regex: None,
             field: "path".into(),
             operator: "in".into(),
             value: Some(serde_yaml::Value::Sequence(vec![
@@ -756,7 +865,11 @@ mod tests {
 
     #[test]
     fn test_method_equals() {
-        let c = make_condition("method", "equals", Some(serde_yaml::Value::String("POST".into())));
+        let c = make_condition(
+            "method",
+            "equals",
+            Some(serde_yaml::Value::String("POST".into())),
+        );
         assert!(evaluate_condition(&c, &make_ctx("/", "POST", "127.0.0.1")));
         assert!(evaluate_condition(&c, &make_ctx("/", "post", "127.0.0.1")));
         assert!(!evaluate_condition(&c, &make_ctx("/", "GET", "127.0.0.1")));
@@ -764,7 +877,11 @@ mod tests {
 
     #[test]
     fn test_method_not_equals() {
-        let c = make_condition("method", "not_equals", Some(serde_yaml::Value::String("GET".into())));
+        let c = make_condition(
+            "method",
+            "not_equals",
+            Some(serde_yaml::Value::String("GET".into())),
+        );
         assert!(evaluate_condition(&c, &make_ctx("/", "POST", "127.0.0.1")));
         assert!(!evaluate_condition(&c, &make_ctx("/", "GET", "127.0.0.1")));
     }
@@ -772,6 +889,7 @@ mod tests {
     #[test]
     fn test_method_in() {
         let c = Condition {
+            compiled_regex: None,
             field: "method".into(),
             operator: "in".into(),
             value: Some(serde_yaml::Value::Sequence(vec![
@@ -789,6 +907,7 @@ mod tests {
     #[test]
     fn test_ip_in_cidr() {
         let c = Condition {
+            compiled_regex: None,
             field: "client_ip".into(),
             operator: "in".into(),
             value: Some(serde_yaml::Value::Sequence(vec![
@@ -798,12 +917,16 @@ mod tests {
         };
         assert!(evaluate_condition(&c, &make_ctx("/", "GET", "10.1.2.3")));
         assert!(evaluate_condition(&c, &make_ctx("/", "GET", "127.0.0.1")));
-        assert!(!evaluate_condition(&c, &make_ctx("/", "GET", "192.168.1.1")));
+        assert!(!evaluate_condition(
+            &c,
+            &make_ctx("/", "GET", "192.168.1.1")
+        ));
     }
 
     #[test]
     fn test_ip_not_in_cidr() {
         let c = Condition {
+            compiled_regex: None,
             field: "client_ip".into(),
             operator: "not_in".into(),
             value: Some(serde_yaml::Value::Sequence(vec![
@@ -816,7 +939,11 @@ mod tests {
 
     #[test]
     fn test_ip_equals() {
-        let c = make_condition("client_ip", "equals", Some(serde_yaml::Value::String("1.2.3.4".into())));
+        let c = make_condition(
+            "client_ip",
+            "equals",
+            Some(serde_yaml::Value::String("1.2.3.4".into())),
+        );
         assert!(evaluate_condition(&c, &make_ctx("/", "GET", "1.2.3.4")));
         assert!(!evaluate_condition(&c, &make_ctx("/", "GET", "5.6.7.8")));
     }
@@ -825,7 +952,11 @@ mod tests {
 
     #[test]
     fn test_body_equals_bool() {
-        let c = make_condition("body.HostConfig.Privileged", "equals", Some(serde_yaml::Value::Bool(true)));
+        let c = make_condition(
+            "body.HostConfig.Privileged",
+            "equals",
+            Some(serde_yaml::Value::Bool(true)),
+        );
         let mut ctx = make_ctx("/containers/create", "POST", "127.0.0.1");
         ctx.body_json = Some(json!({"HostConfig": {"Privileged": true}}));
         assert!(evaluate_condition(&c, &ctx));
@@ -836,7 +967,11 @@ mod tests {
 
     #[test]
     fn test_body_equals_string() {
-        let c = make_condition("body.HostConfig.NetworkMode", "equals", Some(serde_yaml::Value::String("host".into())));
+        let c = make_condition(
+            "body.HostConfig.NetworkMode",
+            "equals",
+            Some(serde_yaml::Value::String("host".into())),
+        );
         let mut ctx = make_ctx("/containers/create", "POST", "127.0.0.1");
         ctx.body_json = Some(json!({"HostConfig": {"NetworkMode": "host"}}));
         assert!(evaluate_condition(&c, &ctx));
@@ -847,7 +982,12 @@ mod tests {
 
     #[test]
     fn test_body_exists() {
-        let c = Condition { field: "body.HostConfig.Binds".into(), operator: "exists".into(), value: None };
+        let c = Condition {
+            compiled_regex: None,
+            field: "body.HostConfig.Binds".into(),
+            operator: "exists".into(),
+            value: None,
+        };
         let mut ctx = make_ctx("/containers/create", "POST", "127.0.0.1");
         ctx.body_json = Some(json!({"HostConfig": {"Binds": ["/tmp:/tmp"]}}));
         assert!(evaluate_condition(&c, &ctx));
@@ -858,7 +998,12 @@ mod tests {
 
     #[test]
     fn test_body_not_exists() {
-        let c = Condition { field: "body.HostConfig.Binds".into(), operator: "not_exists".into(), value: None };
+        let c = Condition {
+            compiled_regex: None,
+            field: "body.HostConfig.Binds".into(),
+            operator: "not_exists".into(),
+            value: None,
+        };
         let mut ctx = make_ctx("/containers/create", "POST", "127.0.0.1");
         ctx.body_json = Some(json!({"HostConfig": {}}));
         assert!(evaluate_condition(&c, &ctx));
@@ -869,7 +1014,11 @@ mod tests {
 
     #[test]
     fn test_body_contains() {
-        let c = make_condition("body.Image", "contains", Some(serde_yaml::Value::String("nginx".into())));
+        let c = make_condition(
+            "body.Image",
+            "contains",
+            Some(serde_yaml::Value::String("nginx".into())),
+        );
         let mut ctx = make_ctx("/containers/create", "POST", "127.0.0.1");
         ctx.body_json = Some(json!({"Image": "nginx:latest"}));
         assert!(evaluate_condition(&c, &ctx));
@@ -880,7 +1029,11 @@ mod tests {
 
     #[test]
     fn test_body_number_equals() {
-        let c = make_condition("body.Count", "equals", Some(serde_yaml::Value::Number(serde_yaml::Number::from(42))));
+        let c = make_condition(
+            "body.Count",
+            "equals",
+            Some(serde_yaml::Value::Number(serde_yaml::Number::from(42))),
+        );
         let mut ctx = make_ctx("/", "POST", "127.0.0.1");
         ctx.body_json = Some(json!({"Count": 42}));
         assert!(evaluate_condition(&c, &ctx));
@@ -893,15 +1046,24 @@ mod tests {
 
     #[test]
     fn test_header_equals() {
-        let c = make_condition("header.content-type", "equals", Some(serde_yaml::Value::String("application/json".into())));
+        let c = make_condition(
+            "header.content-type",
+            "equals",
+            Some(serde_yaml::Value::String("application/json".into())),
+        );
         let mut ctx = make_ctx("/", "POST", "127.0.0.1");
-        ctx.headers.insert("content-type".into(), "application/json".into());
+        ctx.headers
+            .insert("content-type".into(), "application/json".into());
         assert!(evaluate_condition(&c, &ctx));
     }
 
     #[test]
     fn test_header_case_insensitive() {
-        let c = make_condition("header.x-custom", "equals", Some(serde_yaml::Value::String("hello".into())));
+        let c = make_condition(
+            "header.x-custom",
+            "equals",
+            Some(serde_yaml::Value::String("hello".into())),
+        );
         let mut ctx = make_ctx("/", "GET", "127.0.0.1");
         ctx.headers.insert("X-Custom".into(), "hello".into());
         assert!(evaluate_condition(&c, &ctx));
@@ -909,10 +1071,16 @@ mod tests {
 
     #[test]
     fn test_header_exists() {
-        let c = Condition { field: "header.authorization".into(), operator: "exists".into(), value: None };
+        let c = Condition {
+            compiled_regex: None,
+            field: "header.authorization".into(),
+            operator: "exists".into(),
+            value: None,
+        };
         let mut ctx = make_ctx("/", "GET", "127.0.0.1");
         assert!(!evaluate_condition(&c, &ctx));
-        ctx.headers.insert("authorization".into(), "Bearer x".into());
+        ctx.headers
+            .insert("authorization".into(), "Bearer x".into());
         assert!(evaluate_condition(&c, &ctx));
     }
 
@@ -922,8 +1090,16 @@ mod tests {
     fn test_or_node_matches_any() {
         let node = ConditionNode::Or {
             or: vec![
-                ConditionNode::Leaf(make_condition("path", "equals", Some(serde_yaml::Value::String("/a".into())))),
-                ConditionNode::Leaf(make_condition("path", "equals", Some(serde_yaml::Value::String("/b".into())))),
+                ConditionNode::Leaf(make_condition(
+                    "path",
+                    "equals",
+                    Some(serde_yaml::Value::String("/a".into())),
+                )),
+                ConditionNode::Leaf(make_condition(
+                    "path",
+                    "equals",
+                    Some(serde_yaml::Value::String("/b".into())),
+                )),
             ],
         };
         assert!(evaluate_node(&node, &make_ctx("/a", "GET", "127.0.0.1")));
@@ -935,12 +1111,26 @@ mod tests {
     fn test_and_node_matches_all() {
         let node = ConditionNode::And {
             and: vec![
-                ConditionNode::Leaf(make_condition("path", "starts_with", Some(serde_yaml::Value::String("/volumes".into())))),
-                ConditionNode::Leaf(make_condition("method", "not_equals", Some(serde_yaml::Value::String("GET".into())))),
+                ConditionNode::Leaf(make_condition(
+                    "path",
+                    "starts_with",
+                    Some(serde_yaml::Value::String("/volumes".into())),
+                )),
+                ConditionNode::Leaf(make_condition(
+                    "method",
+                    "not_equals",
+                    Some(serde_yaml::Value::String("GET".into())),
+                )),
             ],
         };
-        assert!(evaluate_node(&node, &make_ctx("/volumes/create", "POST", "127.0.0.1")));
-        assert!(!evaluate_node(&node, &make_ctx("/volumes", "GET", "127.0.0.1")));
+        assert!(evaluate_node(
+            &node,
+            &make_ctx("/volumes/create", "POST", "127.0.0.1")
+        ));
+        assert!(!evaluate_node(
+            &node,
+            &make_ctx("/volumes", "GET", "127.0.0.1")
+        ));
     }
 
     #[test]
@@ -949,11 +1139,23 @@ mod tests {
             and: vec![
                 ConditionNode::Or {
                     or: vec![
-                        ConditionNode::Leaf(make_condition("path", "equals", Some(serde_yaml::Value::String("/a".into())))),
-                        ConditionNode::Leaf(make_condition("path", "equals", Some(serde_yaml::Value::String("/b".into())))),
+                        ConditionNode::Leaf(make_condition(
+                            "path",
+                            "equals",
+                            Some(serde_yaml::Value::String("/a".into())),
+                        )),
+                        ConditionNode::Leaf(make_condition(
+                            "path",
+                            "equals",
+                            Some(serde_yaml::Value::String("/b".into())),
+                        )),
                     ],
                 },
-                ConditionNode::Leaf(make_condition("method", "equals", Some(serde_yaml::Value::String("POST".into())))),
+                ConditionNode::Leaf(make_condition(
+                    "method",
+                    "equals",
+                    Some(serde_yaml::Value::String("POST".into())),
+                )),
             ],
         };
         assert!(evaluate_node(&node, &make_ctx("/a", "POST", "127.0.0.1")));
@@ -978,7 +1180,10 @@ mod tests {
         for _ in 0..5 {
             assert!(rl.check("test-ip-2", 5, 60, 60));
         }
-        assert!(!rl.check("test-ip-2", 5, 60, 60), "6th request should be blocked");
+        assert!(
+            !rl.check("test-ip-2", 5, 60, 60),
+            "6th request should be blocked"
+        );
     }
 
     #[test]
@@ -1106,7 +1311,11 @@ mod tests {
         let rules = vec![Rule {
             name: "block".into(),
             action: "deny".into(),
-            conditions: vec![ConditionNode::Leaf(make_condition("path", "equals", Some(serde_yaml::Value::String("/secret".into()))))],
+            conditions: vec![ConditionNode::Leaf(make_condition(
+                "path",
+                "equals",
+                Some(serde_yaml::Value::String("/secret".into())),
+            ))],
             status: Some(403),
             message: Some("blocked".into()),
             ..Default::default()
@@ -1135,7 +1344,11 @@ mod tests {
         let rules = vec![Rule {
             name: "admin-only".into(),
             action: "require_role".into(),
-            conditions: vec![ConditionNode::Leaf(make_condition("path", "equals", Some(serde_yaml::Value::String("/create".into()))))],
+            conditions: vec![ConditionNode::Leaf(make_condition(
+                "path",
+                "equals",
+                Some(serde_yaml::Value::String("/create".into())),
+            ))],
             role: Some("admin".into()),
             ..Default::default()
         }];
@@ -1151,7 +1364,11 @@ mod tests {
         let rules = vec![Rule {
             name: "admin-only".into(),
             action: "require_role".into(),
-            conditions: vec![ConditionNode::Leaf(make_condition("path", "equals", Some(serde_yaml::Value::String("/create".into()))))],
+            conditions: vec![ConditionNode::Leaf(make_condition(
+                "path",
+                "equals",
+                Some(serde_yaml::Value::String("/create".into())),
+            ))],
             role: Some("admin".into()),
             ..Default::default()
         }];
@@ -1167,17 +1384,34 @@ mod tests {
         let rules = vec![Rule {
             name: "rl".into(),
             action: "rate_limit".into(),
-            conditions: vec![ConditionNode::Leaf(make_condition("path", "matches", Some(serde_yaml::Value::String("^/".into()))))],
-            rate_limit: Some(RateLimitConfig { requests: 2, period: 60, penalty: 60 }),
+            conditions: vec![ConditionNode::Leaf(make_condition(
+                "path",
+                "matches",
+                Some(serde_yaml::Value::String("^/".into())),
+            ))],
+            rate_limit: Some(RateLimitConfig {
+                requests: 2,
+                period: 60,
+                penalty: 60,
+            }),
             status: Some(429),
             message: Some("too fast".into()),
             ..Default::default()
         }];
         let rl = RateLimiter::new();
         let ctx = make_ctx("/test", "GET", "10.0.0.1");
-        assert!(matches!(evaluate_request(&rules, &ctx, &rl), RuleResult::Allow));
-        assert!(matches!(evaluate_request(&rules, &ctx, &rl), RuleResult::Allow));
-        assert!(matches!(evaluate_request(&rules, &ctx, &rl), RuleResult::Deny { status: 429, .. }));
+        assert!(matches!(
+            evaluate_request(&rules, &ctx, &rl),
+            RuleResult::Allow
+        ));
+        assert!(matches!(
+            evaluate_request(&rules, &ctx, &rl),
+            RuleResult::Allow
+        ));
+        assert!(matches!(
+            evaluate_request(&rules, &ctx, &rl),
+            RuleResult::Deny { status: 429, .. }
+        ));
     }
 
     #[test]
@@ -1185,10 +1419,16 @@ mod tests {
         let rules = vec![Rule {
             name: "filter".into(),
             action: "response_filter".into(),
-            conditions: vec![ConditionNode::Leaf(make_condition("path", "equals", Some(serde_yaml::Value::String("/json".into()))))],
-            response_filter: Some(vec![
-                ResponseFilterEntry { field: "Env".into(), action: "redact".into(), replacement: None },
-            ]),
+            conditions: vec![ConditionNode::Leaf(make_condition(
+                "path",
+                "equals",
+                Some(serde_yaml::Value::String("/json".into())),
+            ))],
+            response_filter: Some(vec![ResponseFilterEntry {
+                field: "Env".into(),
+                action: "redact".into(),
+                replacement: None,
+            }]),
             ..Default::default()
         }];
         let filters = collect_response_filters(&rules, &make_ctx("/json", "GET", "127.0.0.1"));
@@ -1201,10 +1441,16 @@ mod tests {
         let rules = vec![Rule {
             name: "filter".into(),
             action: "response_filter".into(),
-            conditions: vec![ConditionNode::Leaf(make_condition("path", "equals", Some(serde_yaml::Value::String("/json".into()))))],
-            response_filter: Some(vec![
-                ResponseFilterEntry { field: "Env".into(), action: "redact".into(), replacement: None },
-            ]),
+            conditions: vec![ConditionNode::Leaf(make_condition(
+                "path",
+                "equals",
+                Some(serde_yaml::Value::String("/json".into())),
+            ))],
+            response_filter: Some(vec![ResponseFilterEntry {
+                field: "Env".into(),
+                action: "redact".into(),
+                replacement: None,
+            }]),
             ..Default::default()
         }];
         let filters = collect_response_filters(&rules, &make_ctx("/other", "GET", "127.0.0.1"));
@@ -1217,13 +1463,21 @@ mod tests {
             Rule {
                 name: "allow".into(),
                 action: "allow".into(),
-                conditions: vec![ConditionNode::Leaf(make_condition("path", "equals", Some(serde_yaml::Value::String("/ping".into()))))],
+                conditions: vec![ConditionNode::Leaf(make_condition(
+                    "path",
+                    "equals",
+                    Some(serde_yaml::Value::String("/ping".into())),
+                ))],
                 ..Default::default()
             },
             Rule {
                 name: "block".into(),
                 action: "deny".into(),
-                conditions: vec![ConditionNode::Leaf(make_condition("path", "matches", Some(serde_yaml::Value::String("^/".into()))))],
+                conditions: vec![ConditionNode::Leaf(make_condition(
+                    "path",
+                    "matches",
+                    Some(serde_yaml::Value::String("^/".into())),
+                ))],
                 ..Default::default()
             },
         ];
@@ -1282,7 +1536,11 @@ mod tests {
                 "matches",
                 Some(serde_yaml::Value::String("^/".into())),
             ))],
-            rate_limit: Some(crate::config::RateLimitConfig { requests: 1, period: 60, penalty: 60 }),
+            rate_limit: Some(crate::config::RateLimitConfig {
+                requests: 1,
+                period: 60,
+                penalty: 60,
+            }),
             dry_run: Some(true),
             ..Default::default()
         }];

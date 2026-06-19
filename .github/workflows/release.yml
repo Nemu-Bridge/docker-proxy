@@ -1,0 +1,126 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: version tag to publish, e.g. v1.0.1
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  bin_name: docker-proxy
+  zig_version: "0.13.0"
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: docker-proxy-linux-x86_64
+            zig: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            asset: docker-proxy-linux-aarch64
+            zig: true
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: docker-proxy-macos-x86_64
+            zig: false
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: docker-proxy-macos-arm64
+            zig: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: install_zigbuild
+        if: matrix.zig
+        run: |
+          curl -fsSL "https://ziglang.org/download/${zig_version}/zig-linux-x86_64-${zig_version}.tar.xz" | tar -xJ
+          echo "$PWD/zig-linux-x86_64-${zig_version}" >> "$GITHUB_PATH"
+          cargo install cargo-zigbuild
+      - name: build_zig
+        if: matrix.zig
+        run: cargo zigbuild --release --target ${{ matrix.target }} --bin "$bin_name"
+      - name: build_native
+        if: ${{ !matrix.zig }}
+        run: cargo build --release --target ${{ matrix.target }} --bin "$bin_name"
+      - name: stage_asset
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${bin_name}" "dist/${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+      gpg_passphrase: ${{ secrets.GPG_PASSPHRASE }}
+    steps:
+      - name: resolve_tag
+        run: echo "release_tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: generate_checksums
+        working-directory: dist
+        run: sha256sum ${bin_name}-* > SHA256SUMS
+      - name: sign_checksums
+        working-directory: dist
+        run: |
+          if [ -z "$gpg_private_key" ]; then
+            echo "no signing key configured, publishing checksums without a signature"
+            exit 0
+          fi
+          echo "$gpg_private_key" | gpg --batch --import
+          key_id=$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/{print $5; exit}')
+          gpg --batch --pinentry-mode loopback --passphrase "$gpg_passphrase" \
+            --armor --detach-sign --local-user "$key_id" \
+            -o SHA256SUMS.asc SHA256SUMS
+      - name: publish_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.release_tag }}
+          name: ${{ env.release_tag }}
+          fail_on_unmatched_files: false
+          files: |
+            dist/docker-proxy-linux-x86_64
+            dist/docker-proxy-linux-aarch64
+            dist/docker-proxy-macos-x86_64
+            dist/docker-proxy-macos-arm64
+            dist/SHA256SUMS
+            dist/SHA256SUMS.asc
+          body: |
+            ## install
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/Nemu-Bridge/docker-proxy/main/setup -o setup
+            sudo bash setup
+            ```
+
+            The installer downloads the matching binary for your platform, verifies it against `SHA256SUMS`, generates admin and readonly tokens into `/etc/docker-proxy/config.yaml`, and installs and starts the systemd service.
+
+            Linux builds are statically linked (musl). macOS builds: `arm64` for Apple Silicon, `x86_64` for Intel.
+
+            If `SHA256SUMS.asc` is attached, verify it with the project release signing key before trusting the checksums.

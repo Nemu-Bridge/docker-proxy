@@ -1,4 +1,4 @@
-use docker_proxy::config::{Condition, ConditionNode, ProxyConfig, Rule};
+use docker_proxy::config::{yaml_value_to_string, Condition, ConditionNode, ProxyConfig, Rule};
 use docker_proxy::metrics::Metrics;
 use docker_proxy::rules::{
     evaluate_request, evaluate_request_detailed, AuthLimiter, EvaluationContext, RateLimiter,
@@ -7,17 +7,27 @@ use docker_proxy::rules::{
 use docker_proxy::tls;
 use docker_proxy::upgrade::is_upgrade_request;
 use hyper::header::{HeaderMap, HeaderValue};
+use regex::Regex;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 fn make_condition(field: &str, operator: &str, value: Option<serde_yaml::Value>) -> Condition {
-    Condition {
+    let mut condition = Condition {
+        compiled_regex: None,
         field: field.to_string(),
         operator: operator.to_string(),
         value,
+    };
+    if matches!(condition.operator.as_str(), "matches" | "not_matches") {
+        if let Some(ref v) = condition.value {
+            if let Some(s) = yaml_value_to_string(v) {
+                condition.compiled_regex = Regex::new(&s).ok();
+            }
+        }
     }
+    condition
 }
 
 fn make_ctx(path: &str, method: &str, ip: &str) -> EvaluationContext {
@@ -33,27 +43,29 @@ fn make_ctx(path: &str, method: &str, ip: &str) -> EvaluationContext {
 
 #[test]
 fn integration_deny_secrets_allow_containers() {
-    let rules = vec![
-        Rule {
-            name: "block-secrets".into(),
-            action: "deny".into(),
-            conditions: vec![ConditionNode::Leaf(make_condition(
-                "path",
-                "starts_with",
-                Some(serde_yaml::Value::String("/secrets".into())),
-            ))],
-            message: Some("secrets blocked".into()),
-            status: Some(403),
-            ..Default::default()
-        },
-    ];
+    let rules = vec![Rule {
+        name: "block-secrets".into(),
+        action: "deny".into(),
+        conditions: vec![ConditionNode::Leaf(make_condition(
+            "path",
+            "starts_with",
+            Some(serde_yaml::Value::String("/secrets".into())),
+        ))],
+        message: Some("secrets blocked".into()),
+        status: Some(403),
+        ..Default::default()
+    }];
 
     let rl = RateLimiter::new();
 
     let result = evaluate_request(&rules, &make_ctx("/secrets", "GET", "10.0.0.1"), &rl);
     assert!(matches!(result, RuleResult::Deny { status: 403, .. }));
 
-    let result = evaluate_request(&rules, &make_ctx("/containers/json", "GET", "10.0.0.1"), &rl);
+    let result = evaluate_request(
+        &rules,
+        &make_ctx("/containers/json", "GET", "10.0.0.1"),
+        &rl,
+    );
     assert!(matches!(result, RuleResult::Allow));
 }
 
@@ -180,9 +192,15 @@ fn integration_parse_mtls_example() {
     assert_eq!(auth.auth_type.as_deref(), Some("mtls"));
     let mtls = auth.mtls.as_ref().unwrap();
     let map = mtls.cert_role_map.as_ref().unwrap();
-    assert!(map.iter().any(|m| m.cn == "admin.ops.example.com" && m.role == "admin"));
+    assert!(map
+        .iter()
+        .any(|m| m.cn == "admin.ops.example.com" && m.role == "admin"));
     assert_eq!(mtls.default_role.as_deref(), Some("user"));
-    let dry_run_rule = cfg.rules.as_ref().unwrap().iter()
+    let dry_run_rule = cfg
+        .rules
+        .as_ref()
+        .unwrap()
+        .iter()
         .find(|r| r.name == "watch-new-image-pulls")
         .expect("dry-run rule must exist");
     assert_eq!(dry_run_rule.dry_run, Some(true));
@@ -252,6 +270,7 @@ fn integration_metrics_render_includes_all_counters() {
     m.requests_allowed.fetch_add(3, Ordering::Relaxed);
     m.auth_failures_total.fetch_add(1, Ordering::Relaxed);
     m.upgrade_total.fetch_add(1, Ordering::Relaxed);
+    m.request_timeouts_total.fetch_add(1, Ordering::Relaxed);
     m.observe_upstream_latency_ms(40);
     m.record_rule_deny("block-secrets", false);
 
@@ -262,6 +281,7 @@ fn integration_metrics_render_includes_all_counters() {
         "docker_proxy_requests_allowed_total",
         "docker_proxy_auth_failures_total",
         "docker_proxy_upgrade_total",
+        "docker_proxy_request_timeouts_total",
         "docker_proxy_upstream_latency_ms_count",
         "rule=\"block-secrets\"",
     ] {
