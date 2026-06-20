@@ -79,6 +79,9 @@ jobs:
     steps:
       - name: resolve_tag
         run: echo "release_tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -98,12 +101,46 @@ jobs:
           gpg --batch --pinentry-mode loopback --passphrase "$gpg_passphrase" \
             --armor --detach-sign --local-user "$key_id" \
             -o SHA256SUMS.asc SHA256SUMS
+      - name: build_release_body
+        env:
+          repo: ${{ github.repository }}
+        run: |
+          current="$release_tag"
+          previous=$(git describe --tags --abbrev=0 "${current}^" 2>/dev/null || echo "")
+          {
+            echo "## install"
+            echo ""
+            echo '```bash'
+            echo "curl -fsSL https://raw.githubusercontent.com/${repo}/main/setup -o setup"
+            echo "sudo bash setup"
+            echo '```'
+            echo ""
+            echo "The installer downloads the matching binary for your platform, verifies it against \`SHA256SUMS\`, generates admin and readonly tokens into \`/etc/docker-proxy/config.yaml\`, and installs and starts the systemd service."
+            echo ""
+            echo "Linux builds are statically linked (musl). macOS builds: \`arm64\` for Apple Silicon, \`x86_64\` for Intel."
+            echo ""
+            echo "## changes"
+            echo ""
+            if [ -n "$previous" ]; then
+              git log --no-merges --pretty=format:'- %s (%h)' "${previous}..${current}"
+            else
+              git log --no-merges --pretty=format:'- %s (%h)'
+            fi
+            echo ""
+            if [ -n "$previous" ]; then
+              echo ""
+              echo "**full changelog:** https://github.com/${repo}/compare/${previous}...${current}"
+            fi
+            echo ""
+            echo "If \`SHA256SUMS.asc\` is attached, verify it with the project release signing key before trusting the checksums."
+          } > release_body.md
       - name: publish_release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.release_tag }}
           name: ${{ env.release_tag }}
           fail_on_unmatched_files: false
+          body_path: release_body.md
           files: |
             dist/docker-proxy-linux-x86_64
             dist/docker-proxy-linux-aarch64
@@ -111,16 +148,3 @@ jobs:
             dist/docker-proxy-macos-arm64
             dist/SHA256SUMS
             dist/SHA256SUMS.asc
-          body: |
-            ## install
-
-            ```bash
-            curl -fsSL https://raw.githubusercontent.com/Nemu-Bridge/docker-proxy/main/setup -o setup
-            sudo bash setup
-            ```
-
-            The installer downloads the matching binary for your platform, verifies it against `SHA256SUMS`, generates admin and readonly tokens into `/etc/docker-proxy/config.yaml`, and installs and starts the systemd service.
-
-            Linux builds are statically linked (musl). macOS builds: `arm64` for Apple Silicon, `x86_64` for Intel.
-
-            If `SHA256SUMS.asc` is attached, verify it with the project release signing key before trusting the checksums.
